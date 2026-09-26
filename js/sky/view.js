@@ -36,11 +36,38 @@ export function angleBetween(a, b) {
   return Math.acos(Math.max(-1, Math.min(1, dot(norm(a), norm(b))))) / DEG;
 }
 
-// Атмосферная рефракция (формула Сэмундссона), градусы. Поднимает объекты у горизонта.
+// Атмосферная рефракция, градусы: поднимает объекты у горизонта.
+// Та же формула, что у astronomy-engine (Horizon(..., 'normal')), чтобы звёзды, созвездия,
+// спутники и планеты у горизонта сдвигались одинаково.
 export function refraction(altDeg) {
-  if (altDeg < -1.5) return 0;
-  const h = Math.max(altDeg, -1);
-  return 1.02 / Math.tan((h + 10.3 / (h + 5.11)) * DEG) / 60;
+  if (altDeg > 89.99) return 0;
+  const h = altDeg < -1 ? -1 : altDeg;
+  let r = 1.02 / Math.tan((h + 10.3 / (h + 5.11)) * DEG) / 60;
+  if (altDeg < -1) r *= (altDeg + 90) / 89;
+  return r;
+}
+
+// Видимая (с рефракцией) высота по геометрической.
+export function apparentAlt(altDeg) {
+  return altDeg + refraction(altDeg);
+}
+
+// То же для единичного вектора (восток, север, вверх); результат пишется в out[k..k+2].
+export function refractInto(e, n, u, out, k) {
+  const alt = Math.asin(u < -1 ? -1 : u > 1 ? 1 : u) / DEG;
+  const r = refraction(alt);
+  if (r === 0) {
+    out[k] = e;
+    out[k + 1] = n;
+    out[k + 2] = u;
+    return;
+  }
+  const alt2 = (alt + r) * DEG;
+  const h = Math.sqrt(Math.max(1e-12, e * e + n * n));
+  const c = Math.cos(alt2) / h;
+  out[k] = e * c;
+  out[k + 1] = n * c;
+  out[k + 2] = Math.sin(alt2);
 }
 
 // Камера: оси right (r), up (u), forward (f) в мировой системе.

@@ -27,11 +27,24 @@ export const FEATURED = { 25544: 'МКС', 20580: 'Хаббл', 48274: 'Тянь
 // Порядок важности групп при удалении дублей (один спутник бывает в нескольких группах).
 const GROUP_PRIORITY = ['stations', 'hubble', 'visual', 'starlink'];
 
-// CelesTrak просит не скачивать одни и те же данные чаще раза в 2 часа; обновляем раз в 12.
+// CelesTrak просит не скачивать одни и те же данные чаще раза в 2 часа: группу, успешно
+// скачанную с CelesTrak менее 2 часов назад, не запрашиваем даже по кнопке «Обновить» (force).
+export const TLE_MIN_INTERVAL_MS = 2 * 3600 * 1000;
+// Данные с CelesTrak обновляем раз в 12 часов.
 export const TLE_MAX_AGE_MS = 12 * 3600 * 1000;
-// После неудачного запроса к CelesTrak не повторяем его полчаса (CelesTrak блокирует адреса,
-// с которых идёт много ошибочных запросов); копию на сайте при этом всё равно пробуем.
+// Данные из копии на сайте (data/tle) устаревают через 2 часа — затем снова пробуем CelesTrak.
+export const TLE_MIRROR_MAX_AGE_MS = 2 * 3600 * 1000;
+// Копия на сайте, где самая свежая орбита старше 7 суток, не заменяет более новый кэш;
+// если новее ничего нет — принимается с пометкой sources[g].mirrorOutdated.
+export const TLE_MIRROR_MAX_EPOCH_AGE_MS = 7 * 86400 * 1000;
+// Пауза после неудачного запроса к CelesTrak (CelesTrak блокирует адреса, с которых идёт много
+// ошибочных запросов); копию на сайте при этом всё равно пробуем. Действует и при force.
+//  - HTTP-ошибка (403/429/5xx и прочие), неверный ответ, TypeError при наличии сети
+//    (в браузере блокировка CelesTrak без CORS-заголовков тоже выглядит как TypeError): 30 минут;
+//  - истекло время ожидания (AbortError/TimeoutError): 3 минуты;
+//  - устройство без сети (navigator.onLine === false): ошибка не запоминается.
 export const TLE_RETRY_AFTER_MS = 30 * 60 * 1000;
+export const TLE_RETRY_AFTER_TIMEOUT_MS = 3 * 60 * 1000;
 
 const CACHE_NAME = 'tle-data-v1'; // НЕ «sky-scout-…»: такие кэши удаляет сервис-воркер
 const META_KEY = 'sky-scout:tle-meta-v1';
@@ -611,8 +624,11 @@ export function findPasses(
  * Хранилище по умолчанию: текст — в Cache Storage ('tle-data-v1'), время загрузки — в localStorage.
  * Если Cache Storage недоступно — текст небольших групп кладём в localStorage, иначе в память.
  * Интерфейс: {getText(group) → string|null, setText(group, text, fetchedAt),
- *   getMeta(group) → {fetchedAt, failedAt?}|null, setMeta?(group, patch)} (методы могут возвращать Promise).
- * setText записывает meta заново ({fetchedAt}); setMeta (необязательный) дополняет её, например failedAt.
+ *   getMeta(group) → {fetchedAt, from?, netOkAt?, failedAt?, retryAfterMs?}|null, setMeta?(group, patch)}
+ *   (методы могут возвращать Promise).
+ * setText записывает meta заново ({fetchedAt}); setMeta (необязательный) дополняет её:
+ *   from — откуда текст ('network' | 'mirror'), netOkAt — время последней успешной загрузки с CelesTrak,
+ *   failedAt / retryAfterMs — время последней ошибки CelesTrak и пауза после неё.
  */
 export function createDefaultStore() {
   const memText = new Map();
@@ -708,13 +724,16 @@ export function createDefaultStore() {
   };
 }
 
-/** Хранилище в памяти (для тестов и как запасной вариант). */
+/**
+ * Хранилище в памяти (для тестов и как запасной вариант).
+ * initial: {group: {text, fetchedAt, ...прочие поля meta (from, netOkAt, failedAt, retryAfterMs)}}.
+ */
 export function createMemoryStore(initial = {}) {
   const text = new Map();
   const meta = new Map();
-  for (const [g, v] of Object.entries(initial)) {
-    text.set(g, v.text);
-    meta.set(g, { fetchedAt: v.fetchedAt ?? null });
+  for (const [g, { text: t, ...m }] of Object.entries(initial)) {
+    text.set(g, t);
+    meta.set(g, { ...m, fetchedAt: m.fetchedAt ?? null });
   }
   return {
     getText: (g) => text.get(g) ?? null,
@@ -740,6 +759,24 @@ function describeError(e) {
   return String(e.message || e);
 }
 
+// У самого устройства нет сети (браузер знает об этом точно только в эту сторону).
+function deviceOffline() {
+  try {
+    const nav = globalThis.navigator;
+    return !!nav && nav.onLine === false;
+  } catch {
+    return false;
+  }
+}
+
+// Пауза перед следующим запросом к CelesTrak после ошибки e; 0 — ошибку не запоминать.
+function retryDelayAfter(e) {
+  if (deviceOffline()) return 0; // CelesTrak ни при чём — повторим, как только появится сеть
+  if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) return TLE_RETRY_AFTER_TIMEOUT_MS;
+  // HTTP 403/429/5xx, неверный ответ, TypeError при наличии сети (так же выглядит блокировка без CORS).
+  return TLE_RETRY_AFTER_MS;
+}
+
 async function fetchTleText(fetchImpl, url, group, timeoutMs) {
   const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = ac ? setTimeout(() => ac.abort(), timeoutMs) : null;
@@ -747,6 +784,7 @@ async function fetchTleText(fetchImpl, url, group, timeoutMs) {
     const res = await fetchImpl(url, ac ? { signal: ac.signal, cache: 'no-cache' } : { cache: 'no-cache' });
     if (!res || !res.ok) {
       const err = new Error(`HTTP ${res ? res.status : '?'}`);
+      err.status = res ? res.status : 0;
       err.userMessage = res && res.status ? `сервер ответил ошибкой ${res.status}` : 'пустой ответ';
       throw err;
     }
@@ -775,6 +813,26 @@ function resolveMirror(mirror, baseUrl) {
 
 const newestEpoch = (sats) => sats.reduce((m, s) => (s.epochMs > m ? s.epochMs : m), -Infinity);
 
+// Самая старая и самая свежая эпоха орбит группы (null, если спутников нет).
+function epochRange(sats) {
+  let oldest = Infinity;
+  let newest = -Infinity;
+  for (const s of sats) {
+    if (!Number.isFinite(s.epochMs)) continue;
+    if (s.epochMs < oldest) oldest = s.epochMs;
+    if (s.epochMs > newest) newest = s.epochMs;
+  }
+  return newest === -Infinity ? { oldest: null, newest: null } : { oldest, newest };
+}
+
+// Время последней успешной загрузки группы с CelesTrak (null — неизвестно).
+// Старая meta (без поля from) писалась только при загрузке — считаем её загрузкой с CelesTrak.
+function lastCelestrakOk(meta) {
+  if (Number.isFinite(meta.netOkAt)) return meta.netOkAt;
+  if (meta.from === undefined && Number.isFinite(meta.fetchedAt)) return meta.fetchedAt;
+  return null;
+}
+
 function mergeGroups(parsed, groupIds) {
   const order = [...GROUP_PRIORITY.filter((g) => groupIds.includes(g)), ...groupIds.filter((g) => !GROUP_PRIORITY.includes(g))];
   const seen = new Set();
@@ -790,13 +848,23 @@ function mergeGroups(parsed, groupIds) {
 }
 
 /**
- * Загружает спутники: сначала сразу из кэша (onUpdate), затем обновляет устаревшие группы
- * (старше 12 ч, отсутствующие или force): CelesTrak → копия на сайте (mirror) → остаётся кэш.
- * После ошибки CelesTrak группа полчаса не запрашивается у него повторно (кроме force).
+ * Загружает спутники: сначала сразу из кэша (onUpdate), затем обновляет устаревшие группы:
+ * отсутствующие, скачанные с CelesTrak больше 12 ч назад, взятые из копии на сайте больше 2 ч назад
+ * или все при force. Порядок: CelesTrak → копия на сайте (mirror) → остаётся кэш.
+ * Бережём CelesTrak (даже при force):
+ *  - группу, успешно скачанную с CelesTrak меньше 2 ч назад, не запрашиваем (sources[g].skippedFresh);
+ *  - после ошибки CelesTrak выдерживаем паузу (TLE_RETRY_AFTER_MS / TLE_RETRY_AFTER_TIMEOUT_MS),
+ *    отметка об ошибке сохраняется и тогда, когда данные пришли из копии на сайте.
  * @param opts.store     хранилище {getText, setText, getMeta, setMeta?} (по умолчанию Cache Storage + localStorage)
  * @param opts.baseUrl   относительно чего разрешать адрес копии (по умолчанию location.href)
- * @returns Promise<{sats, sources}>; sources[groupId] = {fetchedAt, from: 'network'|'mirror'|'cache'|null,
- *   error: строка, если свежие данные получить не удалось, networkError: ошибка CelesTrak (если была), count}
+ * @returns Promise<{sats, sources}>; sources[groupId] = {
+ *   fetchedAt — когда данные скачаны (не возраст орбит!),
+ *   from: 'network'|'mirror'|'cache'|null,
+ *   error: строка, если свежие данные получить не удалось, networkError: ошибка CelesTrak (если была),
+ *   count,
+ *   skippedFresh: true — при force группа не запрашивалась: скачана с CelesTrak меньше 2 ч назад,
+ *   mirrorOutdated: true — данные из копии на сайте, самая свежая орбита старше 7 суток,
+ *   newestEpochMs / oldestEpochMs — самая свежая / самая старая эпоха орбит группы (мс) или null}
  */
 export async function loadSatellites({
   groups = ['stations', 'visual', 'hubble', 'starlink'],
@@ -813,9 +881,16 @@ export async function loadSatellites({
   const ids = defs.map((d) => d.id);
   const parsed = {};
   const sources = {};
+  const origin = {}; // откуда текущие данные группы: 'network' | 'mirror' | null
   const snapshot = () => ({
     sats: mergeGroups(parsed, ids),
-    sources: Object.fromEntries(ids.map((g) => [g, { ...sources[g] }])),
+    sources: Object.fromEntries(
+      ids.map((g) => {
+        const { newest, oldest } = epochRange(parsed[g]);
+        const mirrorOutdated = origin[g] === 'mirror' && newest !== null && now - newest > TLE_MIRROR_MAX_EPOCH_AGE_MS;
+        return [g, { ...sources[g], mirrorOutdated, newestEpochMs: newest, oldestEpochMs: oldest }];
+      }),
+    ),
   });
   const emit = (res) => {
     if (typeof onUpdate === 'function') {
@@ -841,15 +916,18 @@ export async function loadSatellites({
         /* хранилище недоступно */
       }
       const sats = text ? parseTle(text, d.id) : [];
-      metaOf[d.id] = meta || {};
+      const m = meta && typeof meta === 'object' ? meta : {};
+      metaOf[d.id] = m;
       cachedText[d.id] = sats.length ? text : null;
       parsed[d.id] = sats;
+      origin[d.id] = sats.length ? (m.from === 'mirror' ? 'mirror' : 'network') : null;
       sources[d.id] = {
-        fetchedAt: sats.length ? (meta && Number.isFinite(meta.fetchedAt) ? meta.fetchedAt : null) : null,
+        fetchedAt: sats.length ? (Number.isFinite(m.fetchedAt) ? m.fetchedAt : null) : null,
         from: sats.length ? 'cache' : null,
         error: null,
         networkError: null,
         count: sats.length,
+        skippedFresh: false,
       };
     }),
   );
@@ -858,19 +936,31 @@ export async function loadSatellites({
   // (б) обновление устаревших групп — параллельно, ошибки групп независимы
   const stale = defs.filter((d) => {
     const s = sources[d.id];
-    return force || !cachedText[d.id] || !Number.isFinite(s.fetchedAt) || now - s.fetchedAt > TLE_MAX_AGE_MS || s.fetchedAt > now + 3600000;
+    const maxAge = origin[d.id] === 'mirror' ? TLE_MIRROR_MAX_AGE_MS : TLE_MAX_AGE_MS;
+    return force || !cachedText[d.id] || !Number.isFinite(s.fetchedAt) || now - s.fetchedAt > maxAge || s.fetchedAt > now + 3600000;
   });
   if (!stale.length) return snapshot();
 
   await Promise.all(
     stale.map(async (d) => {
       const src = sources[d.id];
+      const meta = metaOf[d.id];
+      const netOkAt = lastCelestrakOk(meta);
+
+      // С CelesTrak скачано меньше 2 ч назад — данные свежие, повторно не запрашиваем.
+      if (cachedText[d.id] && netOkAt !== null && now >= netOkAt && now - netOkAt < TLE_MIN_INTERVAL_MS) {
+        src.skippedFresh = true;
+        return;
+      }
+
       let got = null;
       let from = null;
       let netErr = null;
       let mirErr = null;
-      const failedAt = metaOf[d.id].failedAt;
-      const backoff = !force && Number.isFinite(failedAt) && now >= failedAt && now - failedAt < TLE_RETRY_AFTER_MS;
+      // Ошибка CelesTrak, случившаяся после последней успешной загрузки с него.
+      let failedAt = Number.isFinite(meta.failedAt) && !(netOkAt !== null && meta.failedAt <= netOkAt) ? meta.failedAt : null;
+      let retryAfterMs = Number.isFinite(meta.retryAfterMs) && meta.retryAfterMs > 0 ? meta.retryAfterMs : TLE_RETRY_AFTER_MS;
+      const backoff = failedAt !== null && now >= failedAt && now - failedAt < retryAfterMs;
       if (typeof fetchImpl === 'function') {
         if (backoff) {
           netErr = 'недавно был недоступен, повторим позже';
@@ -880,10 +970,15 @@ export async function loadSatellites({
             from = 'network';
           } catch (e) {
             netErr = describeError(e);
-            try {
-              await st.setMeta?.(d.id, { failedAt: now });
-            } catch {
-              /* не страшно */
+            const delay = retryDelayAfter(e);
+            if (delay > 0) {
+              failedAt = now;
+              retryAfterMs = delay;
+              try {
+                await st.setMeta?.(d.id, { failedAt, retryAfterMs });
+              } catch {
+                /* не страшно */
+              }
             }
           }
         }
@@ -899,7 +994,8 @@ export async function loadSatellites({
         netErr = 'загрузка из сети недоступна';
       }
 
-      // Копия на сайте может оказаться старее кэша — тогда оставляем кэш.
+      // Копия на сайте может оказаться старее кэша — тогда оставляем кэш (в том числе
+      // копию с орбитами старше 7 суток: её принимаем, только если новее ничего нет).
       if (got && from === 'mirror' && parsed[d.id].length && newestEpoch(got.sats) < newestEpoch(parsed[d.id])) {
         got = null;
         mirErr = 'копия на сайте старее сохранённых данных';
@@ -907,13 +1003,24 @@ export async function loadSatellites({
 
       if (got) {
         parsed[d.id] = got.sats;
+        origin[d.id] = from;
         src.fetchedAt = now;
         src.from = from;
         src.error = null;
         src.networkError = from === 'mirror' ? netErr : null;
         src.count = got.sats.length;
+        // setText переписывает meta ({fetchedAt}); остальное дописываем следом. Для копии на сайте
+        // сохраняем время последней загрузки с CelesTrak и отметку об ошибке — чтобы CelesTrak
+        // спросили снова после обычной паузы, а не через 12 ч.
+        const extra = { from };
+        if (from === 'network') extra.netOkAt = now;
+        else {
+          if (netOkAt !== null) extra.netOkAt = netOkAt;
+          if (failedAt !== null) Object.assign(extra, { failedAt, retryAfterMs });
+        }
         try {
           await st.setText(d.id, got.text, now);
+          await st.setMeta?.(d.id, extra);
         } catch {
           /* не сохранилось — не страшно */
         }

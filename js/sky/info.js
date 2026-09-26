@@ -6,6 +6,12 @@ import { starName, starDesignation } from './scene.js';
 
 const KM_PER_AU = 149597870.7;
 const DAY = 86400000;
+const NB = '\u00A0'; // неразрывный пробел: число не отрывается от единицы
+
+// «417 км», «8,6 св. года» — число и единица всегда в одной строке.
+export function unit(n, u) {
+  return `${n}${NB}${u.replace(/ /g, NB)}`;
+}
 
 export function dayLabel(fmt, ms, now) {
   const key = fmt.dateKey(ms);
@@ -16,7 +22,7 @@ export function dayLabel(fmt, ms, now) {
 }
 
 export function whenText(fmt, ms, now) {
-  return `${dayLabel(fmt, ms, now)} в ${fmt.time(ms)}`;
+  return `${dayLabel(fmt, ms, now)} в${NB}${fmt.time(ms)}`;
 }
 
 export function altText(alt) {
@@ -36,16 +42,23 @@ export function positionText(alt, az) {
 }
 
 export function kmText(km) {
-  return `${Math.round(km).toLocaleString('ru-RU')} км`;
+  return unit(Math.round(km).toLocaleString('ru-RU'), 'км');
 }
 
 function auText(au) {
   const mkm = (au * KM_PER_AU) / 1e6;
-  const minutes = (au * KM_PER_AU) / 299792.458 / 60;
+  const minutes = Math.round((au * KM_PER_AU) / 299792.458 / 60);
   const light = minutes < 60
-    ? `${Math.round(minutes)} ${plural(Math.round(minutes), 'минута', 'минуты', 'минут')}`
-    : `${Math.floor(minutes / 60)} ч ${Math.round(minutes % 60)} мин`;
-  return `${decimal(au, au < 10 ? 2 : 1)} а. е. (${decimal(mkm, mkm < 100 ? 1 : 0)} млн км), свет идёт ${light}`;
+    ? unit(minutes, plural(minutes, 'минуту', 'минуты', 'минут'))
+    : `${unit(Math.floor(minutes / 60), 'ч')} ${unit(minutes % 60, 'мин')}`;
+  return `${unit(decimal(au, au < 10 ? 2 : 1), 'а. е.')} (${unit(decimal(mkm, mkm < 100 ? 1 : 0), 'млн км')}), свет идёт ${light}`;
+}
+
+// Световые годы с правильным падежом: «4,2 св. года», «101 св. год», «25 св. лет».
+export function lightYearsText(ly) {
+  const n = ly < 10 ? Math.round(ly * 10) / 10 : Math.round(ly);
+  if (!Number.isInteger(n)) return `≈${NB}${unit(decimal(n, 1), 'св. года')}`;
+  return `≈${NB}${unit(n.toLocaleString('ru-RU'), plural(n, 'св. год', 'св. года', 'св. лет'))}`;
 }
 
 function magText(m) {
@@ -106,11 +119,11 @@ export function bodyCard(sky, b, fmt, now, cat) {
     rows.push(['Фаза', `${name}, освещена на ${Math.round((b.illum ?? 0) * 100)}%`]);
     rows.push(['Расстояние', kmText(b.distKm)]);
   } else if (b.kind === 'sun') {
-    rows.push(['Расстояние', `${decimal(b.distKm / 1e6, 1)} млн км, свет идёт 8 минут`]);
+    rows.push(['Расстояние', `${unit(decimal(b.distKm / 1e6, 1), 'млн км')}, свет идёт ${unit(Math.round(b.distKm / 299792.458 / 60), 'минут')}`]);
   } else {
     rows.push(['Расстояние', auText(b.distAU)]);
   }
-  if (Number.isFinite(b.mag) && b.kind !== 'sun') rows.push(['Блеск', `${magText(b.mag)} зв. вел.`]);
+  if (Number.isFinite(b.mag) && b.kind !== 'sun') rows.push(['Блеск', unit(magText(b.mag), 'зв. вел.')]);
   let where = null;
   if (b.kind === 'planet' || b.kind === 'moon') {
     const eq = A.Equator(b.body, new Date(now), sky.observer, false, true);
@@ -134,8 +147,8 @@ export function starCard(sky, cat, i, fmt, now) {
   const dist = cat.dist[h];
   A.DefineStar(A.Body.Star3, cat.ra[i] / 15, cat.dec[i], dist || 1000);
   rows.push(...riseSetRows(A.Body.Star3, sky.observer, now, fmt, alt));
-  if (dist) rows.push(['Расстояние', `≈ ${dist >= 100 ? Math.round(dist).toLocaleString('ru-RU') : decimal(dist, 1)} св. лет`]);
-  rows.push(['Блеск', `${magText(cat.mag[i])} зв. вел.`]);
+  if (dist) rows.push(['Расстояние', lightYearsText(dist)]);
+  rows.push(['Блеск', unit(magText(cat.mag[i]), 'зв. вел.')]);
   const cons = constellationOf(cat, cat.ra[i] / 15, cat.dec[i]);
   if (cons) rows.push(['Созвездие', cons]);
   return {
@@ -146,46 +159,70 @@ export function starCard(sky, cat, i, fmt, now) {
   };
 }
 
-// «моложе суток», «1,4 дня назад», «12 дней назад»
+// Возраст орбиты: «менее суток назад», «1,4 дня назад», «12 дней назад».
+// Если время на шкале раньше даты орбиты — «на 3 дня новее выбранного момента».
 export function ageText(days) {
-  if (days < 1) return 'моложе суток';
-  if (days < 10 && Math.abs(days - Math.round(days)) >= 0.05) return `${decimal(days, 1)} дня назад`;
-  const n = Math.round(days);
-  return `${n} ${plural(n, 'день', 'дня', 'дней')} назад`;
+  const d = Math.abs(days);
+  let text;
+  if (d < 1) text = null;
+  else if (d < 10 && Math.abs(d - Math.round(d)) >= 0.05) text = unit(decimal(d, 1), 'дня');
+  else {
+    const n = Math.round(d);
+    text = unit(n, plural(n, 'день', 'дня', 'дней'));
+  }
+  if (days >= 0) return text ? `${text} назад` : 'менее суток назад';
+  return text ? `на ${text} новее выбранного момента` : 'менее суток от выбранного момента';
 }
 
+// Пролёт: для видимого — только та часть, когда спутник освещён и небо тёмное.
 export function passText(p, fmt, now) {
-  const from = direction8(p.rise.az).short;
-  const to = direction8(p.set.az).short;
-  const mins = Math.max(1, Math.round((p.set.t - p.rise.t) / 60000));
+  const mins = (a, b) => unit(Math.max(1, Math.round((b - a) / 60000)), 'мин');
+  if (p.visible && p.vis) {
+    const v = p.vis;
+    return {
+      when: `${dayLabel(fmt, v.from.t, now)}, ${fmt.time(v.from.t)}–${fmt.time(v.to.t)}`,
+      path: `${direction8(v.from.az).short} → ${direction8(v.to.az).short}, выше всего ${Math.round(v.max.alt)}° в${NB}${fmt.time(v.max.t)}, виден ${mins(v.from.t, v.to.t)}`,
+      visible: true,
+    };
+  }
   return {
     when: `${dayLabel(fmt, p.rise.t, now)}, ${fmt.time(p.rise.t)}–${fmt.time(p.set.t)}`,
-    path: `${from} → ${to}, выше всего ${Math.round(p.max.alt)}° в ${fmt.time(p.max.t)}, ${mins} мин`,
-    visible: p.visible,
+    path: `${direction8(p.rise.az).short} → ${direction8(p.set.az).short}, выше всего ${Math.round(p.max.alt)}° в${NB}${fmt.time(p.max.t)}, ${mins(p.rise.t, p.set.t)}`,
+    visible: false,
   };
 }
 
-export function satCard(sat, pos, fmt, now, { passes = null, ageDays = null, groupTitle = '' } = {}) {
+const SAT_KIND = { 25544: 'Орбитальная станция', 48274: 'Орбитальная станция', 20580: 'Космический телескоп' };
+
+export function satCard(sat, pos, fmt, now, { passes = null, next = null, ageDays = null, groupTitle = '' } = {}) {
   const rows = [];
   if (pos) {
     rows.push(['Высота, азимут', positionText(pos.alt, pos.az)]);
-    rows.push(['Расстояние', `${kmText(pos.rangeKm)} от вас; летит в ${kmText(pos.heightKm)} над Землёй со скоростью ${decimal(pos.speedKmS, 1)} км/с`]);
-    rows.push(['Освещение', pos.sunlit ? 'освещён Солнцем' : 'в тени Земли']);
   } else {
     rows.push(['Положение', 'не удалось рассчитать — орбита устарела']);
   }
-  if (ageDays !== null) rows.push(['Орбита от', ageText(ageDays)]);
-  let note = null;
-  if (pos && pos.alt > 0) {
-    note = pos.sunlit
-      ? 'Сейчас над горизонтом и освещён: если небо тёмное, виден как движущаяся звезда.'
-      : 'Сейчас над горизонтом, но в тени Земли — глазом не виден.';
+  const extra = [];
+  if (pos) {
+    extra.push(['Расстояние', `${kmText(pos.rangeKm)} от вас; высота орбиты ${kmText(pos.heightKm)}, скорость ${unit(decimal(pos.speedKmS, 1), 'км/с')}`]);
+    extra.push(['Освещение', pos.sunlit ? 'освещён Солнцем' : 'в тени Земли']);
   }
-  if (ageDays !== null && ageDays > 14) note = `${note ? `${note} ` : ''}Орбита давно не обновлялась — положение может быть неточным.`;
+  if (ageDays !== null) extra.push(['Данные орбиты', ageText(ageDays)]);
+  let lead = null;
+  if (pos && pos.alt > 0 && pos.sunlit) lead = 'Сейчас над горизонтом и освещён: в тёмном небе виден как движущаяся звезда.';
+  else if (pos && pos.alt > 0) lead = 'Сейчас над горизонтом, но в тени Земли — глазом не виден.';
+  if (next) {
+    const t = passText(next, fmt, now);
+    lead = `${lead ? `${lead} ` : ''}${next.visible ? 'Следующий видимый пролёт' : 'Следующий пролёт'}: ${t.when}, ${t.path}.`;
+  }
+  let note = null;
+  if (ageDays !== null && Math.abs(ageDays) > 14) note = 'Данные орбиты старые — положение может быть неточным.';
+  const kind = SAT_KIND[sat.id] || (sat.group === 'starlink' ? 'Спутник Starlink' : `Спутник · ${(groupTitle || 'NORAD').toLowerCase()}`);
   return {
     title: sat.name,
-    subtitle: `Спутник · ${groupTitle || 'NORAD'} · № ${sat.id}`,
+    subtitle: `${kind} · №${NB}${sat.id}`,
+    lead,
     rows,
+    extra,
     note,
     passes: passes ? passes.map((p) => passText(p, fmt, now)) : null,
   };

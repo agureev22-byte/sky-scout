@@ -72,19 +72,22 @@ export function cameraAxes(R, screenDeg = 0) {
   return { r, u, f };
 }
 
-// Курс «вперёд» в системе датчика: плашмя — куда смотрит верх телефона,
-// вертикально — куда смотрит задняя камера, задран в небо — тоже по камере.
-// Так же ведёт себя компас iPhone. Горизонтальные проекции камеры (−z) и верха (±y)
-// складываются, поэтому курс не вырождается ни при каком наклоне.
-export function forwardHeading(R) {
-  const y = col(R, 1);
-  const z = col(R, 2);
-  const s = z[2] >= 0 ? 1 : -1; // экран вверх — «вперёд» это верх телефона, экран вниз — его низ
-  const e = s * y[0] - z[0];
-  const n = s * y[1] - z[1];
-  let h = Math.atan2(e, n) / DEG;
+function azimuthOf(v) {
+  let h = Math.atan2(v[0], v[1]) / DEG;
   if (h < 0) h += 360;
   return h;
+}
+
+// Эталон для сверки с компасом iPhone — только в однозначных положениях телефона:
+// вертикально и почти без крена — курс задней камеры (−z); плашмя экраном вверх — курс верха (+y).
+// В остальных положениях (наклон ~45°, альбомная ориентация, экраном вниз) iOS может считать
+// курс по-другому, поэтому там поправку не учим, а держим прежнюю.
+export function compassReference(R) {
+  const up = R[2][2]; // вертикальная составляющая оси z устройства
+  const roll = Math.abs(R[2][0]); // вертикальная составляющая оси x: крен
+  if (Math.abs(up) < 0.5 && roll < 0.3) return azimuthOf([-R[0][2], -R[1][2], -R[2][2]]);
+  if (up > 0.85) return azimuthOf([R[0][1], R[1][1], R[2][1]]);
+  return null;
 }
 
 // Поворот вектора вокруг зенита на угол по часовой стрелке (прибавка к азимуту).
@@ -104,8 +107,9 @@ export class OrientationTracker {
     this.onChange = onChange || (() => {});
     this.R = null;
     this.lastEvent = 0;
+    this.hasData = false; // было хотя бы одно событие после start()
     this.mode = 'none'; // 'ios' | 'absolute' | 'relative'
-    this.offset = null; // курс устройства → магнитный курс, градусы
+    this.offset = null; // поправка курса датчика к магнитному курсу, градусы (null — ещё не известна)
     this.accuracy = null;
     this.smooth = null;
     this.listening = false;
@@ -121,12 +125,21 @@ export class OrientationTracker {
   }
 
   stop() {
-    if (!this.listening) return;
+    if (this.listening && typeof window !== 'undefined') {
+      window.removeEventListener('deviceorientationabsolute', this._onAbs);
+      window.removeEventListener('deviceorientation', this._onRel);
+    }
     this.listening = false;
-    window.removeEventListener('deviceorientationabsolute', this._onAbs);
-    window.removeEventListener('deviceorientation', this._onRel);
+    this.hasData = false;
+    this.R = null;
+    this.smooth = null;
+    this.mode = 'none';
+    this.offset = null;
+    this.accuracy = null;
   }
 
+  // Недавно были события (Android на неподвижном телефоне может молчать — для вида это не важно,
+  // используется только чтобы подсказать «датчики не отвечают»).
   get active() {
     return this.R !== null && Date.now() - this.lastEvent < 3000;
   }
@@ -136,44 +149,48 @@ export class OrientationTracker {
     return this.mode === 'ios' ? this.offset !== null : this.mode === 'absolute';
   }
 
+  // Компас iPhone есть, но поправку ещё не поймали: телефон держат под ~45°.
+  get waitingForCompass() {
+    return this.mode === 'ios' && this.offset === null;
+  }
+
   handle(e, isAbsoluteEvent) {
     if (e.alpha === null || e.beta === null || e.gamma === null || e.alpha === undefined) return;
     // Если приходят абсолютные события, относительные игнорируем.
     if (!isAbsoluteEvent && this.mode === 'absolute') return;
     const R = rotationMatrix(e.alpha, e.beta, e.gamma);
     const heading = typeof e.webkitCompassHeading === 'number' ? e.webkitCompassHeading : null;
-    if (heading !== null && heading >= 0) {
+    const acc = typeof e.webkitCompassAccuracy === 'number' ? e.webkitCompassAccuracy : null;
+    if (heading !== null && heading >= 0 && (acc === null || acc >= 0)) {
       this.mode = 'ios';
-      const acc = typeof e.webkitCompassAccuracy === 'number' ? e.webkitCompassAccuracy : null;
       this.accuracy = acc;
-      // У наклона ~45° iOS может переключать, по какой оси считать курс, — там поправку не обновляем.
-      const tilt = Math.abs(R[2][2]); // |z устройства · вверх|: 1 — плашмя, 0 — вертикально
-      const stable = tilt > 0.8 || tilt < 0.55;
-      if (acc === null || acc >= 0) {
-        const off = wrap180(heading - forwardHeading(R));
+      const ref = compassReference(R);
+      if (ref !== null) {
+        const off = wrap180(heading - ref);
         if (this.offset === null) this.offset = off;
-        else if (stable) this.offset = wrap180(this.offset + 0.08 * wrap180(off - this.offset));
+        else this.offset = wrap180(this.offset + 0.08 * wrap180(off - this.offset));
       }
     } else if (isAbsoluteEvent || e.absolute === true) {
       this.mode = 'absolute';
       this.offset = 0;
-    } else if (this.mode !== 'ios') {
+    } else if (this.mode === 'none') {
+      // Компаса пока нет (или iOS ещё не откалибровал его) — углы относительные.
       this.mode = 'relative';
-      if (this.offset === null) this.offset = 0;
     }
     this.R = R;
+    this.hasData = true;
     this.lastEvent = Date.now();
     this.onChange();
   }
 
   // Оси камеры в истинной (географической) системе.
-  // declination — магнитное склонение (восток +), userOffset — ручная калибровка.
+  // declination — магнитное склонение (восток +), userOffset — ручная подстройка.
   axes(declination = 0, userOffset = 0, smoothing = 0.3) {
     if (!this.R) return null;
     const raw = cameraAxes(this.R, screenAngle());
     // Абсолютные углы (Android) и компас iPhone привязаны к магнитному северу.
-    const magnetic = this.mode === 'ios' || this.mode === 'absolute';
-    const corr = (this.offset || 0) + (magnetic ? declination : 0) + userOffset;
+    const magnetic = this.hasCompass;
+    const corr = (this.offset ?? 0) + (magnetic ? declination : 0) + userOffset;
     let f = rotateAzimuth(raw.f, corr);
     let u = rotateAzimuth(raw.u, corr);
     if (this.smooth && smoothing > 0) {

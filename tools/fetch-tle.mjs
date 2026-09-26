@@ -5,9 +5,12 @@
 //   node tools/fetch-tle.mjs            — все группы с копией (stations, visual, hubble)
 //   node tools/fetch-tle.mjs hubble     — только указанные
 // Старый файл остаётся, если загрузка не удалась или пришли не те данные.
-// Код выхода ненулевой, только если не удалось обновить ни одну группу. Нужен Node 20+ (глобальный fetch).
+// Каталог data/tle создаётся всегда (даже если ни одного файла не появилось) — на него рассчитан
+// шаг `git add -A -- data/tle` в workflow.
+// Код выхода ненулевой, только если не удалось обновить ни одну группу. Нужен Node 20+ (глобальный fetch),
+// workflow запускает на Node 22.
 
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TLE_GROUPS, parseTle } from '../js/satellites.js';
@@ -52,9 +55,19 @@ async function download(url) {
 async function updateGroup(group) {
   const file = path.join(ROOT, group.mirror);
   const { status, ok, body } = await download(group.url);
-  // CelesTrak отвечает 403 с пояснением, если данные не менялись с прошлой загрузки с этого адреса.
+  // CelesTrak отвечает 403 с пояснением, если данные не менялись с прошлой загрузки с этого адреса
+  // (адреса раннеров GitHub общие, так что это возможно и при самом первом запуске).
   if (!ok && /not updated since your last successful download/i.test(body)) {
-    return { changed: false, note: 'CelesTrak: данные не обновлялись с прошлой загрузки, файл оставлен' };
+    const exists = await access(file).then(
+      () => true,
+      () => false,
+    );
+    return {
+      changed: false,
+      note: exists
+        ? 'CelesTrak: данные не обновлялись с прошлой загрузки, файл оставлен'
+        : 'CelesTrak: данные не обновлялись с прошлой загрузки с этого адреса; файла копии пока нет — появится при следующем запуске',
+    };
   }
   if (!ok) throw new Error(`HTTP ${status}: ${body.slice(0, 120).trim()}`);
 
@@ -83,6 +96,9 @@ async function main() {
   if (!groups.length) {
     console.error(`Нет таких групп с копией на сайте: ${wanted.join(', ')}`);
     process.exit(2);
+  }
+  for (const dir of new Set(groups.map((g) => path.dirname(path.join(ROOT, g.mirror))))) {
+    await mkdir(dir, { recursive: true });
   }
 
   const results = await Promise.all(

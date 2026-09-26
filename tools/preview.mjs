@@ -88,17 +88,28 @@ async function newPage({ time, lat = 41.39, lon = 2.17, camera = false }) {
 }
 
 // Эмуляция iPhone: события ориентации с webkitCompassHeading (камера смотрит на azimuth, alt).
+// Как человек: сначала телефон к горизонту (iPhone «ловит» компас), потом на цель.
+// alpha у iOS отсчитывается от случайного направления — берём сдвиг 73°.
 async function pointPhone(page, az, alt) {
   await page.evaluate(({ az, alt }) => {
     clearInterval(window.__orientTimer);
-    const fire = () => {
+    const ref = 73;
+    const fire = (a) => {
       const e = new Event('deviceorientation');
       const decl = window.__sky.state.declination || 0;
-      Object.assign(e, { alpha: 0, beta: 90 + alt, gamma: 0, absolute: false, webkitCompassHeading: ((az - decl) % 360 + 360) % 360, webkitCompassAccuracy: 5 });
+      Object.assign(e, {
+        alpha: (((360 - az + ref) % 360) + 360) % 360,
+        beta: 90 + a,
+        gamma: 0,
+        absolute: false,
+        webkitCompassHeading: ((az - decl) % 360 + 360) % 360,
+        webkitCompassAccuracy: 5,
+      });
       window.dispatchEvent(e);
     };
-    fire();
-    window.__orientTimer = setInterval(fire, 30);
+    for (let i = 0; i < 5; i++) fire(2);
+    fire(alt);
+    window.__orientTimer = setInterval(() => fire(alt), 30);
   }, { az, alt });
   await page.waitForTimeout(700);
 }
@@ -156,7 +167,7 @@ try {
     await page.mouse.click(hit.x, hit.y);
     await page.waitForTimeout(400);
     assert.match(await page.textContent('#card'), /Сатурн/);
-    assert.match(await page.textContent('#card'), /а\. е\./);
+    assert.match(await page.textContent("#card"), /а\.\sе\./);
     await shot(page, '06-saturn-card');
 
     // МКС: карточка с пролётами
@@ -176,7 +187,7 @@ try {
     await page.waitForTimeout(300);
     const t1 = await page.textContent('#time-main');
     assert.notEqual(t0, t1, 'время сдвинулось');
-    assert.match(await page.textContent('#time-offset'), /\+1 ч/);
+    assert.match(await page.textContent("#time-offset"), /\+1\sч/);
     await shot(page, '08-time-plus1h');
     await page.click('#now-btn');
     await page.waitForTimeout(300);

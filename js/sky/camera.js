@@ -1,13 +1,22 @@
 // Видео с задней камеры для режима AR. Кадры никуда не отправляются — только на экран.
 
 let stream = null;
+// Каждый stopCamera() увеличивает поколение: запуск камеры, начатый раньше, узнаёт,
+// что его отменили (пользователь уже переключил режим), и сам гасит полученный поток.
+let generation = 0;
+
+function abortError() {
+  const e = new Error('Запуск камеры отменён');
+  e.name = 'AbortError';
+  return e;
+}
 
 export function cameraSupported() {
   return typeof navigator !== 'undefined' && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 }
 
 const ERRORS = {
-  NotAllowedError: 'Доступ к камере запрещён. Разрешите его в настройках Safari (Сайты → Камера) и попробуйте снова.',
+  NotAllowedError: 'Доступ к камере запрещён. Разрешите камеру для этого сайта: «аА» в адресной строке Safari → «Настройки веб-сайта» → «Камера», — и снова выберите AR.',
   NotFoundError: 'Камера не найдена.',
   NotReadableError: 'Камера занята другим приложением.',
   OverconstrainedError: 'Камера не поддерживает нужный режим.',
@@ -17,17 +26,25 @@ const ERRORS = {
 export async function startCamera(video) {
   if (!cameraSupported()) throw new Error('Этот браузер не умеет показывать камеру.');
   stopCamera(video);
+  const gen = generation;
+  let s;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
+    s = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
     });
   } catch (err) {
+    if (gen !== generation) throw abortError();
     throw new Error(ERRORS[err && err.name] || 'Не удалось включить камеру.');
   }
+  if (gen !== generation) {
+    s.getTracks().forEach((t) => t.stop());
+    throw abortError();
+  }
+  stream = s;
   video.setAttribute('playsinline', '');
   video.muted = true;
-  video.srcObject = stream;
+  video.srcObject = s;
   try {
     await video.play();
   } catch {
@@ -40,10 +57,12 @@ export async function startCamera(video) {
       setTimeout(done, 1500);
     });
   }
-  return stream;
+  if (gen !== generation) throw abortError();
+  return s;
 }
 
 export function stopCamera(video) {
+  generation++;
   if (stream) {
     stream.getTracks().forEach((t) => t.stop());
     stream = null;

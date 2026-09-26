@@ -1,6 +1,9 @@
 // Рисование неба на canvas. Всё в CSS-пикселях, масштаб под Retina задаётся трансформацией.
 
-import { enu, DEG } from './view.js';
+import { enu, DEG, apparentAlt } from './view.js';
+
+// Точка на небе с учётом рефракции (спутники считаются геометрически).
+const skyVec = (alt, az) => enu(apparentAlt(alt), az);
 import { starName } from './scene.js';
 
 const PALETTES = {
@@ -27,31 +30,35 @@ const PALETTES = {
     select: '#ffd36b',
     reticle: 'rgba(255,255,255,0.55)',
     moonDark: 'rgba(40, 46, 60, 0.9)',
+    sunGlow: 'rgba(255, 215, 106, 0.55)',
     bodyColors: true,
   },
+  // Только красный: зелёная и синяя составляющие не больше 0x18, иначе глаза теряют привычку к темноте.
+  // Состояния различаем яркостью и толщиной линий, а не оттенком.
   red: {
     skyNight: '#000000',
-    skyTwilight: '#070000',
-    skyDay: '#120202',
-    ground: 'rgba(14, 0, 0, 0.78)',
+    skyTwilight: '#060000',
+    skyDay: '#100000',
+    ground: 'rgba(12, 0, 0, 0.8)',
     groundAR: 'rgba(0, 0, 0, 0.3)',
-    horizon: 'rgba(200, 55, 45, 0.9)',
-    cardinal: '#c63a30',
-    cardinalMain: '#ff5747',
-    grid: 'rgba(150, 30, 25, 0.25)',
-    constLine: 'rgba(170, 38, 30, 0.55)',
-    constLabel: 'rgba(210, 60, 48, 0.85)',
-    stars: ['#ff5a4a', '#ff5a4a', '#ff5a4a', '#ff5a4a', '#ff5a4a', '#ff5a4a'],
-    label: '#e0463a',
-    labelDim: '#a8352c',
+    horizon: 'rgba(200, 16, 8, 0.9)',
+    cardinal: '#b01408',
+    cardinalMain: '#ff2410',
+    grid: 'rgba(140, 10, 4, 0.3)',
+    constLine: 'rgba(160, 14, 6, 0.6)',
+    constLabel: 'rgba(210, 22, 10, 0.85)',
+    stars: ['#ff2a14', '#ff2a14', '#ff2a14', '#ff2a14', '#ff2a14', '#ff2a14'],
+    label: '#e81c0c',
+    labelDim: '#a01208',
     labelShadow: 'rgba(0,0,0,0.9)',
-    sat: '#ff6a5a',
-    satFeatured: '#ff8a7a',
-    satShadow: '#6e231d',
-    trail: 'rgba(255, 90, 74, 0.85)',
-    select: '#ff8a7a',
-    reticle: 'rgba(255, 80, 60, 0.6)',
-    moonDark: 'rgba(40, 6, 4, 0.9)',
+    sat: '#ff2a14',
+    satFeatured: '#ff3018',
+    satShadow: '#6a0c04',
+    trail: 'rgba(255, 36, 16, 0.85)',
+    select: '#ff3018',
+    reticle: 'rgba(230, 20, 8, 0.6)',
+    moonDark: 'rgba(36, 0, 0, 0.9)',
+    sunGlow: 'rgba(255, 24, 8, 0.4)',
     bodyColors: false,
   },
 };
@@ -94,8 +101,13 @@ export class Renderer {
     const ctx = this.ctx;
     ctx.font = font;
     const w = ctx.measureText(text).width;
-    const h = parseInt(font, 10) || 12;
+    // высота — размер шрифта в px (строка шрифта может начинаться с жирности: «600 14px …»)
+    const h = Number((/(\d+(?:\.\d+)?)px/.exec(font) || [0, 12])[1]);
+    const W = this.W || 1e9;
     let lx = align === 'center' ? x - w / 2 : x + dx;
+    // у правого края — подпись слева от точки; в любом случае не вылезаем за экран
+    if (align !== 'center' && lx + w > W - 4) lx = x - dx - w;
+    lx = Math.max(4, Math.min(W - w - 4, lx));
     const ly = y + dy;
     const rect = [lx - 2, ly - h, lx + w + 2, ly + 3];
     if (!force) {
@@ -124,6 +136,8 @@ export class Renderer {
     const ar = s.mode === 'ar';
     this.hits = [];
     this.labels = [];
+    this.bodyLabels = [];
+    this.W = W;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.textBaseline = 'alphabetic';
 
@@ -149,13 +163,12 @@ export class Renderer {
       ctx.beginPath();
       const maxJump = Math.max(W, H) * 0.8;
       for (const c of cat.constellations) {
-        for (const line of c.lines) {
+        for (const line of c.linesEnu) {
           let prevOk = false;
           let px = 0;
           let py = 0;
           for (let k = 0; k < line.length; k += 3) {
-            const v = sky.eqjToEnu([line[k], line[k + 1], line[k + 2]]);
-            const ok = view.project(v, p, F);
+            const ok = view.projectXYZ(line[k], line[k + 1], line[k + 2], p, F);
             if (ok && prevOk && Math.abs(p.x - px) + Math.abs(p.y - py) < maxJump) {
               ctx.moveTo(px, py);
               ctx.lineTo(p.x, p.y);
@@ -216,8 +229,8 @@ export class Renderer {
       const maxRank = fov > 110 ? 1 : fov > 70 ? 2 : 3;
       for (const c of cat.constellations) {
         if (c.rank > maxRank) continue;
-        const v = sky.eqjToEnu(c.label);
-        if (!view.project(v, p, F) || !view.isOnScreen(p, -10)) continue;
+        const v = c.labelEnu;
+        if (!view.projectXYZ(v[0], v[1], v[2], p, F) || !view.isOnScreen(p, -10)) continue;
         this.placeLabel(c.name.toUpperCase(), p.x, p.y, '600 11px -apple-system, system-ui, sans-serif', pal.constLabel, { align: 'center', dy: 0 });
       }
     }
@@ -246,6 +259,8 @@ export class Renderer {
     if (s.layers.planets) {
       const order = [...sky.bodies].sort((a, b) => (b.distAU || 0) - (a.distAU || 0));
       for (const b of order) this.drawBody(b, sky, view, F, s);
+      // подписи — после всех дисков, чтобы Луна не закрывала имя соседней планеты
+      for (const l of this.bodyLabels) this.placeLabel(...l);
     }
 
     // ---- выбранный объект ----
@@ -395,6 +410,7 @@ export class Renderer {
     const pal = this.pal;
     const p = this.p;
     if (!view.project(b.vec, p, F) || !view.isOnScreen(p, 40)) return;
+    const centerOnScreen = view.isOnScreen(p, 0);
     const below = b.alt < -0.5;
     const alpha = below ? 0.42 : 1;
     const pxPerDeg = F * DEG;
@@ -404,7 +420,7 @@ export class Renderer {
     if (b.kind === 'sun') {
       r = Math.max(11, b.radiusDeg * pxPerDeg);
       const g = ctx.createRadialGradient(p.x, p.y, r * 0.6, p.x, p.y, r * 3);
-      g.addColorStop(0, pal.bodyColors ? 'rgba(255, 215, 106, 0.55)' : 'rgba(255, 80, 60, 0.45)');
+      g.addColorStop(0, pal.sunGlow);
       g.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = g;
       ctx.beginPath();
@@ -425,14 +441,15 @@ export class Renderer {
       ctx.fill();
     }
     ctx.globalAlpha = 1;
-    if (s.layers.labels) {
+    // Центр за краем экрана — подпись не рисуем: если объект выбран, к нему покажет стрелка.
+    if (s.layers.labels && centerOnScreen) {
       // Солнце, Луна и яркие планеты подписаны всегда; Уран и Нептун — если есть место.
       const bright = b.kind !== 'planet' || (b.mag ?? 9) < 3;
-      this.placeLabel(b.name, p.x, p.y, bright ? '600 14px -apple-system, system-ui, sans-serif' : '12px -apple-system, system-ui, sans-serif', bright ? pal.label : pal.labelDim, {
+      this.bodyLabels.push([b.name, p.x, p.y, bright ? '600 14px -apple-system, system-ui, sans-serif' : '12px -apple-system, system-ui, sans-serif', bright ? pal.label : pal.labelDim, {
         force: bright,
         dx: r + 5,
         alpha: below ? 0.55 : 1,
-      });
+      }]);
     }
     this.hits.push({ x: p.x, y: p.y, r, prio: 3, type: 'body', id: b.id });
   }
@@ -482,19 +499,20 @@ export class Renderer {
       ctx.setLineDash([3, 4]);
       ctx.strokeStyle = pal.trail;
       ctx.globalAlpha = 0.6;
-      for (const tail of s.tails) this.polyline(tail.points, view, F, (pt) => pt.alt > -1);
+      for (const tail of s.tails) this.polyline(tail.points, view, F, (pt) => pt.alt > -1, true);
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
     }
     const dotsLit = [];
     const dotsDark = [];
+    const dotsBelow = [];
     for (let i = 0; i < sats.length; i++) {
       const pos = satPos[i];
       if (!pos) continue;
       const sat = sats[i];
       const important = sat.featured || sat.group === 'stations';
       if (pos.alt < 0 && !important) continue;
-      const v = enu(pos.alt, pos.az);
+      const v = skyVec(pos.alt, pos.az);
       if (!view.project(v, p, F) || !view.isOnScreen(p, 10)) continue;
       const starlink = sat.group === 'starlink';
       const r = sat.featured ? 4 : starlink ? 1.5 : 2.2;
@@ -518,14 +536,14 @@ export class Renderer {
           });
         }
       } else {
-        (pos.sunlit ? dotsLit : dotsDark).push(p.x, p.y, r);
-        if (showLabels && !starlink && fov < 60 && pos.sunlit) {
+        (pos.alt < 0 ? dotsBelow : pos.sunlit ? dotsLit : dotsDark).push(p.x, p.y, r);
+        if (showLabels && !starlink && fov < 60 && pos.sunlit && pos.alt > 0) {
           this.placeLabel(sat.name, p.x, p.y, '11px -apple-system, system-ui, sans-serif', pal.labelDim, { dx: 5, alpha: 0.85 });
         }
       }
       this.hits.push({ x: p.x, y: p.y, r, prio: sat.featured ? 4 : starlink ? 1 : 2, type: 'sat', index: i });
     }
-    for (const [list, color, alpha] of [[dotsDark, pal.satShadow, 0.8], [dotsLit, pal.sat, 1]]) {
+    for (const [list, color, alpha] of [[dotsBelow, pal.satShadow, 0.4], [dotsDark, pal.satShadow, 0.8], [dotsLit, pal.sat, 1]]) {
       if (!list.length) continue;
       ctx.fillStyle = color;
       ctx.globalAlpha = alpha;
@@ -540,14 +558,15 @@ export class Renderer {
   }
 
   // Ломаная по точкам {alt, az}; разрыв там, где точка не видна или filter=false.
-  polyline(points, view, F, filter) {
+  // refract=true — точки спутника (геометрические), поднимаем их рефракцией, как звёзды.
+  polyline(points, view, F, filter, refract = false) {
     const ctx = this.ctx;
     const p = this.p;
     const maxJump = Math.max(view.width, view.height) * 0.5;
     ctx.beginPath();
     let prev = null;
     for (const pt of points) {
-      const ok = (!filter || filter(pt)) && view.project(enu(pt.alt, pt.az), p, F);
+      const ok = (!filter || filter(pt)) && view.project(refract ? skyVec(pt.alt, pt.az) : enu(pt.alt, pt.az), p, F);
       if (ok && prev && Math.abs(p.x - prev.x) + Math.abs(p.y - prev.y) < maxJump) {
         ctx.moveTo(prev.x, prev.y);
         ctx.lineTo(p.x, p.y);
@@ -568,18 +587,18 @@ export class Renderer {
       ctx.lineWidth = 2.5;
       ctx.strokeStyle = pal.trail;
       ctx.globalAlpha = 0.95;
-      this.polyline(sel.track, view, F, (pt) => pt.alt >= 0 && pt.sunlit);
+      this.polyline(sel.track, view, F, (pt) => pt.alt >= 0 && pt.sunlit, true);
       ctx.setLineDash([4, 5]);
       ctx.globalAlpha = 0.7;
-      this.polyline(sel.track, view, F, (pt) => pt.alt >= 0 && !pt.sunlit);
+      this.polyline(sel.track, view, F, (pt) => pt.alt >= 0 && !pt.sunlit, true);
       ctx.globalAlpha = 0.3;
-      this.polyline(sel.track, view, F, (pt) => pt.alt < 0);
+      this.polyline(sel.track, view, F, (pt) => pt.alt < 0, true);
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
       // отметки времени
       for (const pt of sel.track) {
         if (!pt.tick || pt.alt < 0) continue;
-        if (!view.project(enu(pt.alt, pt.az), p, F) || !view.isOnScreen(p)) continue;
+        if (!view.project(skyVec(pt.alt, pt.az), p, F) || !view.isOnScreen(p)) continue;
         ctx.fillStyle = pal.trail;
         ctx.beginPath();
         ctx.arc(p.x, p.y, 2.5, 0, 2 * Math.PI);
@@ -589,12 +608,17 @@ export class Renderer {
     }
 
     if (!sel.vec) return;
-    const onScreen = view.project(sel.vec, p, F) && view.isOnScreen(p, -8);
+    // Тот же критерий, что у подписи объекта: центр на экране — кольцо, иначе — стрелка.
+    const onScreen = view.project(sel.vec, p, F) && view.isOnScreen(p, 0) && p.y < view.height - (s.insets ? s.insets.bottom : 0);
     if (onScreen) {
       ctx.strokeStyle = pal.select;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 2.5;
       ctx.beginPath();
       ctx.arc(p.x, p.y, 20, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 25, 0, 2 * Math.PI);
       ctx.stroke();
       return;
     }

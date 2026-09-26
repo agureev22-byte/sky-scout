@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as A from '../vendor/astronomy.js';
 import { View, enu, altAz, angleBetween } from '../js/sky/view.js';
-import { rotationMatrix, cameraAxes, forwardHeading, rotateAzimuth, OrientationTracker } from '../js/sky/orientation.js';
+import { rotationMatrix, cameraAxes, compassReference, rotateAzimuth, OrientationTracker } from '../js/sky/orientation.js';
 import { Sky } from '../js/sky/scene.js';
 
 const close = (a, b, eps, msg) => assert.ok(Math.abs(a - b) <= eps, `${msg ?? ''} ${a} ≉ ${b} (±${eps})`);
@@ -56,7 +56,7 @@ test('ориентация: телефон вертикально, камера 
   close(f[1], 1, 1e-9, 'камера смотрит на север');
   close(u[2], 1, 1e-9, 'верх экрана — к зениту');
   close(r[0], 1, 1e-9, 'право — на восток');
-  close(forwardHeading(R), 0, 1e-9);
+  close(compassReference(R), 0, 1e-9);
 });
 
 test('ориентация: поворот на запад (alpha = 90) и наклон вверх', () => {
@@ -68,30 +68,74 @@ test('ориентация: поворот на запад (alpha = 90) и на�
   close(altAz(cameraAxes(R2, 0).f).alt, 30, 1e-6);
 });
 
-test('курс «вперёд» устойчив и плашмя, и вертикально', () => {
+// Физическое положение телефона → углы W3C (в системе, где север сдвинут на ref, как у iOS).
+function poseEvent(az, alt, roll, ref = 0, heading = az) {
+  const f = enu(alt, az);
+  const r0 = [Math.cos(az * Math.PI / 180), -Math.sin(az * Math.PI / 180), 0];
+  const u0 = [r0[1] * f[2] - r0[2] * f[1], r0[2] * f[0] - r0[0] * f[2], r0[0] * f[1] - r0[1] * f[0]];
+  const k = roll * Math.PI / 180;
+  const x = r0.map((v, i) => v * Math.cos(k) + u0[i] * Math.sin(k));
+  const y = r0.map((v, i) => -v * Math.sin(k) + u0[i] * Math.cos(k));
+  const z = f.map((v) => -v);
+  const cols = [x, y, z].map((c) => rotateAzimuth(c, -ref)); // система iOS со случайным нулём
+  const M = [0, 1, 2].map((i) => cols.map((c) => c[i]));
+  const sX = M[2][1];
+  const cX = Math.sqrt(Math.max(0, 1 - sX * sX));
+  const deg = 180 / Math.PI;
+  if (cX < 1e-6) {
+    // ровно вертикально: gamma и alpha неразличимы — берём gamma = 0
+    return { alpha: Math.atan2(M[1][0], M[0][0]) * deg, beta: sX > 0 ? 90 : -90, gamma: 0, webkitCompassHeading: ((heading % 360) + 360) % 360, webkitCompassAccuracy: 10 };
+  }
+  return {
+    alpha: Math.atan2(-M[0][1] / cX, M[1][1] / cX) * deg,
+    beta: Math.atan2(sX, cX) * deg,
+    gamma: Math.atan2(-M[2][0] / cX, M[2][2] / cX) * deg,
+    webkitCompassHeading: ((heading % 360) + 360) % 360,
+    webkitCompassAccuracy: 10,
+  };
+}
+
+test('эталон компаса: вертикально — курс камеры, плашмя — курс верха, наклон ~45° — нет', () => {
   for (const alpha of [0, 33, 200]) {
-    const flat = forwardHeading(rotationMatrix(alpha, 0, 0));
-    const upright = forwardHeading(rotationMatrix(alpha, 90, 0));
-    const tilted = forwardHeading(rotationMatrix(alpha, 50, 0));
     const expected = (360 - alpha) % 360;
-    assert.ok(angDiff(flat, expected) < 1e-6);
-    assert.ok(angDiff(upright, expected) < 1e-6);
-    assert.ok(angDiff(tilted, expected) < 1e-6);
-    // телефон задран в небо (камера смотрит вверх под 47°) и почти над головой экраном вниз
-    for (const beta of [120, 137, 150, 175]) {
-      const R = rotationMatrix(alpha, beta, 0);
-      assert.ok(angDiff(forwardHeading(R), expected) < 1e-6, `beta=${beta}`);
-      assert.ok(angDiff(altAz(cameraAxes(R, 0).f).az, expected) < 1e-6, `камера beta=${beta}`);
-    }
+    assert.ok(angDiff(compassReference(rotationMatrix(alpha, 0, 0)), expected) < 1e-6, 'плашмя');
+    assert.ok(angDiff(compassReference(rotationMatrix(alpha, 90, 0)), expected) < 1e-6, 'вертикально');
+    assert.equal(compassReference(rotationMatrix(alpha, 45, 0)), null, 'под 45° не учимся');
+    assert.equal(compassReference(rotationMatrix(alpha, 90, 90)), compassReference(rotationMatrix(alpha, 90, 90)));
   }
 });
 
-test('компас: курс камеры, задранной в небо, берётся из webkitCompassHeading', () => {
+test('компас iPhone: крен и переход через горизонт не сдвигают небо', () => {
+  const ref = 73; // случайный ноль alpha у iOS
+  for (const roll of [0, 10, -12]) {
+    for (const alt of [-2, 2, 20]) {
+      const t = new OrientationTracker();
+      for (let i = 0; i < 40; i++) t.handle(poseEvent(200, alt, roll, ref), false);
+      const aa = altAz(t.axes(0, 0, 0).f);
+      assert.ok(angDiff(aa.az, 200) < 1, `крен ${roll}, высота ${alt}: азимут ${aa.az}`);
+      close(aa.alt, alt, 1e-6);
+    }
+  }
+  // выучили у горизонта — потом держим поправку и в альбомной ориентации, и под 45°,
+  // даже если компас там отвечает иначе
   const t = new OrientationTracker();
-  t.handle({ alpha: 0, beta: 137, gamma: 0, webkitCompassHeading: 200, webkitCompassAccuracy: 5 }, false);
-  const f = t.axes(0, 0, 0).f;
-  close(altAz(f).az, 200, 1e-6);
-  close(altAz(f).alt, 47, 1e-6);
+  for (let i = 0; i < 10; i++) t.handle(poseEvent(120, 0, 0, ref), false);
+  for (let i = 0; i < 60; i++) t.handle(poseEvent(150, 45, 90, ref, 150 + 45), false);
+  assert.ok(angDiff(altAz(t.axes(0, 0, 0).f).az, 150) < 1e-6);
+});
+
+test('компас iPhone: пока компас не откалиброван (−1), поправка не выдумывается', () => {
+  const t = new OrientationTracker();
+  for (let i = 0; i < 5; i++) t.handle({ ...poseEvent(200, 45, 0, 73), webkitCompassHeading: -1 }, false);
+  assert.equal(t.mode, 'relative');
+  assert.equal(t.hasCompass, false);
+  // приходит нормальный курс, но телефон под 45° — ждём удобного положения
+  t.handle(poseEvent(200, 45, 0, 73), false);
+  assert.equal(t.waitingForCompass, true);
+  t.handle(poseEvent(200, 5, 0, 73), false);
+  assert.equal(t.hasCompass, true);
+  t.smooth = null;
+  assert.ok(angDiff(altAz(t.axes(0, 0, 0).f).az, 200) < 1e-6);
 });
 
 test('альбомная ориентация: оси экрана поворачиваются вместе с ним', () => {
@@ -107,7 +151,7 @@ test('компас iPhone: поправка между alpha и webkitCompassHea
   const t = new OrientationTracker();
   // iOS: alpha отсчитан от случайного направления. Пусть истинный курс камеры 100°,
   // а в системе датчика тот же курс соответствует alpha, дающей курс 40°.
-  const alpha = 320; // forwardHeading = 40°
+  const alpha = 320; // курс камеры в системе датчика = 40°
   const ev = { alpha, beta: 90, gamma: 0, webkitCompassHeading: 100, webkitCompassAccuracy: 10 };
   t.handle(ev, false);
   assert.equal(t.mode, 'ios');

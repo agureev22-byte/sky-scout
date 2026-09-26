@@ -1,7 +1,7 @@
 // Что на небе: звёзды и созвездия из каталога, Солнце, Луна и планеты (astronomy-engine).
 
 import * as A from '../../vendor/astronomy.js';
-import { DEG, refraction } from './view.js';
+import { refractInto } from './view.js';
 
 export const BODIES = [
   { id: 'sun', body: A.Body.Sun, name: 'Солнце', kind: 'sun', color: '#ffd76a' },
@@ -16,6 +16,7 @@ export const BODIES = [
 ];
 
 const KM_PER_AU = 149597870.7;
+const DEG = Math.PI / 180;
 
 // ---------- каталог ----------
 
@@ -91,6 +92,7 @@ export function prepareCatalog(starsJson, consJson) {
     gen: c.gen,
     rank: Number(c.rank) || 3,
     label: eqjVector(c.label[0], c.label[1]),
+    labelEnu: new Float32Array(3),
     lines: c.lines.map((line) => {
       const arr = new Float32Array(line.length * 3);
       line.forEach(([r, d], k) => {
@@ -102,6 +104,8 @@ export function prepareCatalog(starsJson, consJson) {
       return arr;
     }),
   }));
+  // Для каждой линии — массив под мировые координаты (пересчитываются каждый кадр без новых объектов).
+  for (const c of constellations) c.linesEnu = c.lines.map((a) => new Float32Array(a.length));
   const conById = new Map(constellations.map((c) => [c.id, c]));
   // Именованные звёзды — для подписей и поиска.
   const named = [];
@@ -189,11 +193,8 @@ export class Sky {
     ];
   }
 
-  // Звёзды в мировой системе с учётом рефракции у горизонта (массив переиспользуется).
-  transformStars(cat) {
-    if (!this.starEnu || this.starEnu.length !== cat.vec.length) this.starEnu = new Float32Array(cat.vec.length);
-    const out = this.starEnu;
-    const v = cat.vec;
+  // J2000 → мир с рефракцией для массива векторов (массив out переиспользуется).
+  transformArray(v, out) {
     const M = this.M;
     const [a0, a1, a2] = M[0];
     const [b0, b1, b2] = M[1];
@@ -202,23 +203,28 @@ export class Sky {
       const x = v[i];
       const y = v[i + 1];
       const z = v[i + 2];
-      let e = a0 * x + a1 * y + a2 * z;
-      let n = b0 * x + b1 * y + b2 * z;
-      let u = c0 * x + c1 * y + c2 * z;
-      if (u > -0.03 && u < 0.35) {
-        const alt = Math.asin(u) / DEG;
-        const alt2 = (alt + refraction(alt)) * DEG;
-        const k = Math.cos(alt2) / Math.sqrt(Math.max(1e-9, 1 - u * u));
-        e *= k;
-        n *= k;
-        u = Math.sin(alt2);
-      }
-      out[i] = e;
-      out[i + 1] = n;
-      out[i + 2] = u;
+      refractInto(a0 * x + a1 * y + a2 * z, b0 * x + b1 * y + b2 * z, c0 * x + c1 * y + c2 * z, out, i);
+    }
+    return out;
+  }
+
+  // Звёзды и созвездия в мировой системе с учётом рефракции (как у планет и спутников).
+  transformStars(cat) {
+    if (!this.starEnu || this.starEnu.length !== cat.vec.length) this.starEnu = new Float32Array(cat.vec.length);
+    this.transformArray(cat.vec, this.starEnu);
+    for (const c of cat.constellations) {
+      c.lines.forEach((line, k) => this.transformArray(line, c.linesEnu[k]));
+      this.transformArray(c.label, c.labelEnu);
     }
     this.starsAt = this.time;
-    return out;
+    return this.starEnu;
+  }
+
+  // Высота Солнца в произвольный момент (для автотемы по реальному времени).
+  sunAltAt(ms) {
+    const date = new Date(ms);
+    const eq = A.Equator(A.Body.Sun, date, this.observer, true, true);
+    return A.Horizon(date, this.observer, eq.ra, eq.dec, 'normal').altitude;
   }
 
   updateBodies(ms) {

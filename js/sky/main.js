@@ -1,28 +1,29 @@
 // Небесный разведчик — живая карта неба.
 // Режимы: «Вручную» (крутить пальцем), «Датчики» (водить телефоном), «AR» (поверх камеры).
 
-import { View, DEG, enu, altAz, angleBetween } from './view.js';
+import { View, enu, altAz, angleBetween, apparentAlt } from './view.js';
 import { Sky, loadCatalog, starName, BODIES } from './scene.js';
 import { Renderer } from './render.js';
 import {
   OrientationTracker, orientationSupported, needsPermission, requestOrientationPermission,
 } from './orientation.js';
 import { startCamera, stopCamera, videoFocal, cameraSupported } from './camera.js';
-import { bodyCard, starCard, satCard, altText, whenText } from './info.js';
+import { bodyCard, starCard, satCard, whenText, unit } from './info.js';
 import { magneticDeclination } from './geomag.js';
 import {
   loadSatellites, makeObserver as satObserver, frameContext, satPosition, track, findPasses, tleAgeDays, TLE_GROUPS,
 } from '../satellites.js';
 import {
-  getSavedLocation, saveLocation, requestPosition, searchPlaces, parseCoords, distanceKm,
+  getSavedLocation, saveLocation, requestPosition, searchPlaces, parseCoords, distanceKm, geolocationPermission,
 } from '../location.js';
-import { makeFormatter, deviceTimeZone, formatCoords, escapeHtml as esc, direction8, decimal } from '../format.js';
+import { makeFormatter, deviceTimeZone, formatCoords, escapeHtml as esc, direction8, decimal, plural } from '../format.js';
 import { storage } from '../storage.js';
 import { initTheme, updateNight, getThemeMode, setThemeMode } from '../theme.js';
 
 const $ = (id) => document.getElementById(id);
 const MIN = 60000;
 const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
 
 const DEFAULT_LAYERS = {
   stars: true, constellations: true, labels: true, planets: true, satellites: true, starlink: true, grid: false,
@@ -31,6 +32,7 @@ const DEFAULT_LAYERS = {
 const settings = {
   layers: { ...DEFAULT_LAYERS, ...(storage.get('layers-v1') || {}) },
   mode: storage.get('mode-v1') || 'manual',
+  // Ручная подстройка поверх настоящего компаса (без компаса поправка своя и не сохраняется).
   compassOffset: Number(storage.get('compass-offset-v1')) || 0,
   arFov: Number(storage.get('ar-fov-v1')) || 63,
   manual: storage.get('manual-view-v1') || { az: 180, alt: 35, fov: 100 },
@@ -53,6 +55,10 @@ const state = {
   satPos: [],
   satT: [],
   satPrev: [],
+  satHidden: [], // модули и пристыкованные корабли — рисуем только саму станцию
+  satDraw: [], // переиспользуемые объекты для продлённых положений Starlink
+  satVisible: [],
+  lastSatMs: 0,
   satSources: null,
   satLoading: false,
   importantIdx: [],
@@ -64,6 +70,9 @@ const state = {
   dirty: true,
   lastDraw: 0,
   calibrating: false,
+  relativeOffset: 0, // подстройка без компаса: живёт только до перезапуска датчиков
+  realSunAlt: null,
+  realSunAt: 0,
   fmt: makeFormatter(deviceTimeZone()),
 };
 
@@ -76,6 +85,8 @@ const video = $('camera');
 let satObs = null;
 
 const skyTime = () => Date.now() + state.timeOffset;
+// Датчики используются, если режим не ручной и от них пришло хоть одно событие.
+const sensorsLive = () => settings.mode !== 'manual' && tracker.hasData;
 
 // ---------- размеры ----------
 
@@ -94,25 +105,49 @@ function setLocation(loc, save = true) {
   if (save) saveLocation(loc);
   sky.setObserver(loc.lat, loc.lon, Number.isFinite(loc.elevation) ? loc.elevation : 0);
   satObs = satObserver(loc.lat, loc.lon, Number.isFinite(loc.elevation) ? loc.elevation : 0);
-  try {
-    state.declination = magneticDeclination(loc.lat, loc.lon, 0, new Date());
-  } catch {
-    state.declination = 0;
-  }
+  const d = magneticDeclination(loc.lat, loc.lon, 0, new Date());
+  state.declination = Number.isFinite(d) ? d : 0;
   state.satT = new Array(state.sats.length).fill(0);
   state.satPos = new Array(state.sats.length).fill(null);
   state.satPrev = new Array(state.sats.length).fill(null);
+  state.lastSatMs = 0;
+  state.realSunAt = 0;
   if (state.selection && state.selection.type === 'sat') {
-    state.selection.passes = null;
-    state.selection.trackAt = 0;
+    Object.assign(state.selection, { passes: null, track: null, trackAt: 0 });
   }
+  cardTimer = 0;
   renderPlace();
   state.dirty = true;
 }
 
 function renderPlace() {
   const loc = state.location;
-  $('place-name').textContent = !loc ? 'Выбрать место' : loc.source === 'gps' ? 'Моё место' : loc.name || 'Точка';
+  const name = !loc ? 'Выбрать место' : loc.source === 'gps' ? 'Моё место' : loc.name || 'Точка';
+  $('place-name').textContent = name;
+  $('place-btn').setAttribute('aria-label', `Место: ${name}. Нажмите, чтобы изменить`);
+}
+
+// При запуске уточняем сохранённую GPS-точку: человек мог уехать на сотни километров.
+async function refreshGpsOnLaunch(saved) {
+  if (!saved || saved.source !== 'gps') return;
+  const age = Date.now() - (saved.updatedAt || 0);
+  const perm = await geolocationPermission();
+  if (perm === 'granted') {
+    try {
+      const pos = await requestPosition({ maximumAge: 10 * MIN });
+      if (state.location && state.location.source === 'gps' && distanceKm(state.location, pos) > 1) setLocation(pos);
+      else if (state.location && state.location.source === 'gps') saveLocation({ ...state.location, updatedAt: Date.now() });
+    } catch {
+      /* остаёмся на сохранённом месте */
+    }
+  } else if (perm !== 'denied' && age > 6 * HOUR) {
+    const days = Math.round(age / DAY);
+    const ago = days >= 1 ? `${days} ${plural(days, 'день', 'дня', 'дней')} назад` : 'несколько часов назад';
+    showBanner(`Место определено ${ago}. Нажмите, чтобы обновить`, () => {
+      hideBanner();
+      locate(false);
+    });
+  }
 }
 
 // ---------- спутники ----------
@@ -124,29 +159,49 @@ function onSatellites({ sats, sources }) {
   state.satPos = new Array(sats.length).fill(null);
   state.satT = new Array(sats.length).fill(0);
   state.satPrev = new Array(sats.length).fill(null);
+  state.satHidden = sats.map((s) => !!s.moduleOf);
+  state.satDraw = new Array(sats.length).fill(null);
+  state.satVisible = new Array(sats.length).fill(null);
+  state.lastSatMs = 0;
   state.importantIdx = [];
   state.starlinkIdx = [];
   sats.forEach((s, i) => (s.group === 'starlink' ? state.starlinkIdx : state.importantIdx).push(i));
   if (prevSel !== null) {
     const idx = sats.findIndex((s) => s.id === prevSel);
-    if (idx >= 0) state.selection.index = idx;
-    else state.selection = null;
+    if (idx >= 0) {
+      // орбиты обновились — пролёты и траекторию считаем заново
+      Object.assign(state.selection, { index: idx, passes: null, track: null, trackAt: 0 });
+      cardTimer = 0;
+    } else select(null);
   }
   state.dirty = true;
   renderSatStatus();
 }
+
+let satNoticeShown = false;
 
 async function refreshSatellites(force = false) {
   if (state.satLoading) return;
   state.satLoading = true;
   renderSatStatus();
   try {
-    await loadSatellites({ force, onUpdate: onSatellites });
+    const res = await loadSatellites({ force, onUpdate: onSatellites });
+    const src = res && res.sources ? Object.values(res.sources) : [];
+    if (force && src.some((g) => g.skippedFresh)) {
+      toast('Орбиты уже свежие: CelesTrak просит скачивать их не чаще раза в два часа.');
+    }
   } catch (err) {
     console.warn('Спутники недоступны', err);
   } finally {
     state.satLoading = false;
     renderSatStatus();
+    if (!state.sats.length && !satNoticeShown) {
+      satNoticeShown = true;
+      toast(navigator.onLine === false
+        ? 'Спутники не загрузились — нет интернета. Попробую снова, когда появится связь.'
+        : 'Спутники пока не загрузились. Попробую ещё раз чуть позже.');
+    }
+    if (state.sats.length) satNoticeShown = false;
   }
 }
 
@@ -161,14 +216,18 @@ function updateSatPositions(ms) {
     satPos[i] = satPosition(sats[i], date, satObs, ctx);
     satT[i] = ms;
   }
+  hideDocked();
+  const jumped = Math.abs(ms - state.lastSatMs) > 4000; // время на шкале прыгнуло
+  state.lastSatMs = ms;
   if (settings.layers.starlink && state.starlinkIdx.length) {
-    // Тысячи Starlink считаем по кругу порциями: весь круг — примерно за 1,5 с,
-    // а между пересчётами положение продлеваем по скорости (см. visibleSatPositions).
+    // Тысячи Starlink в реальном времени считаем по кругу порциями (весь круг ~1,5 с),
+    // а между пересчётами продлеваем движение (см. visibleSatPositions).
+    // После прыжка по шкале времени пересчитываем все сразу.
     const list = state.starlinkIdx;
     const nowWall = performance.now();
     const dt = Math.min(250, Math.max(8, nowWall - (lastSatFrame || nowWall - 16)));
     lastSatFrame = nowWall;
-    const chunk = Math.min(list.length, Math.ceil((list.length * dt) / 1500));
+    const chunk = jumped ? list.length : Math.min(list.length, Math.ceil((list.length * dt) / 1500));
     const prev = state.satPrev;
     for (let k = 0; k < chunk; k++) {
       state.rr = (state.rr + 1) % list.length;
@@ -176,22 +235,49 @@ function updateSatPositions(ms) {
       const old = satPos[i];
       const oldT = satT[i];
       const pos = satPosition(sats[i], date, satObs, ctx);
-      prev[i] = old && pos && ms - oldT > 0 && ms - oldT < 5000 ? { alt: old.alt, az: old.az, t: oldT } : null;
+      prev[i] = !jumped && old && pos && ms - oldT > 0 && ms - oldT < 5000 ? { alt: old.alt, az: old.az, t: oldT } : null;
       satPos[i] = pos;
       satT[i] = ms;
     }
   }
 }
 
-// Позиции для рисования. Starlink между пересчётами продлеваем по скорости,
-// а посчитанные для совсем другого времени (после прокрутки шкалы) — не показываем.
+// Модули станций и пристыкованные корабли (Союз, Прогресс, Шэньчжоу…) летят вместе
+// со станцией — рисуем только её саму.
+function hideDocked() {
+  const { sats, satPos, satHidden } = state;
+  const stations = [];
+  for (const i of state.importantIdx) {
+    if (sats[i].featured && sats[i].id !== 20580 && satPos[i] && satPos[i].eci) stations.push(satPos[i].eci);
+  }
+  for (const i of state.importantIdx) {
+    const s = sats[i];
+    if (s.featured || s.group !== 'stations') continue;
+    const p = satPos[i];
+    let docked = !!s.moduleOf;
+    if (!docked && p && p.eci) {
+      for (const e of stations) {
+        if (Math.hypot(p.eci.x - e.x, p.eci.y - e.y, p.eci.z - e.z) < 5) docked = true;
+      }
+    }
+    satHidden[i] = docked;
+  }
+}
+
+// Позиции для рисования. Starlink между пересчётами продлеваем по скорости (вектором,
+// а не углами — у зенита азимут скачет); посчитанные для другого времени не показываем.
 function visibleSatPositions(ms) {
-  const { satPos, satT, sats, satPrev } = state;
+  const { satPos, satT, sats, satPrev, satHidden, satDraw } = state;
   const showStarlink = settings.layers.starlink;
-  const out = new Array(satPos.length);
+  if (state.satVisible.length !== satPos.length) state.satVisible = new Array(satPos.length);
+  const out = state.satVisible;
   for (let i = 0; i < satPos.length; i++) {
     const p = satPos[i];
-    if (!p || sats[i].group !== 'starlink') {
+    if (!p || satHidden[i]) {
+      out[i] = null;
+      continue;
+    }
+    if (sats[i].group !== 'starlink') {
       out[i] = p;
       continue;
     }
@@ -201,14 +287,21 @@ function visibleSatPositions(ms) {
       continue;
     }
     const q = satPrev[i];
-    if (q && age !== 0) {
-      const span = satT[i] - q.t;
-      const k = age / span;
-      let dAz = p.az - q.az;
-      if (dAz > 180) dAz -= 360;
-      if (dAz < -180) dAz += 360;
-      out[i] = { ...p, alt: p.alt + (p.alt - q.alt) * k, az: (p.az + dAz * k + 360) % 360 };
-    } else out[i] = p;
+    if (!q || age === 0 || p.alt < -3 || p.alt > 85 || q.alt > 85) {
+      out[i] = p;
+      continue;
+    }
+    const k = age / (satT[i] - q.t);
+    const a = enu(p.alt, p.az);
+    const b = enu(q.alt, q.az);
+    const v = [a[0] + (a[0] - b[0]) * k, a[1] + (a[1] - b[1]) * k, a[2] + (a[2] - b[2]) * k];
+    const l = Math.hypot(v[0], v[1], v[2]) || 1;
+    const aa = altAz([v[0] / l, v[1] / l, v[2] / l]);
+    const d = satDraw[i] || (satDraw[i] = {});
+    d.alt = aa.alt;
+    d.az = aa.az;
+    d.sunlit = p.sunlit;
+    out[i] = d;
   }
   return out;
 }
@@ -227,7 +320,7 @@ function updateTails(ms) {
 
 // ---------- выбор объекта ----------
 
-function select(hit) {
+function select(hit, { fromTap = false } = {}) {
   if (!hit) {
     state.selection = null;
     hideCard();
@@ -242,11 +335,18 @@ function select(hit) {
     state.selection = { type: 'star', index: hit.index, name: name || 'Звезда' };
   } else if (hit.type === 'sat') {
     const s = state.sats[hit.index];
+    if (!s) return;
     state.selection = { type: 'sat', index: hit.index, id: s.id, name: s.name, trackAt: 0, passes: null };
   }
   updateSelection(skyTime());
+  buildCard();
   renderCard(true);
   state.dirty = true;
+  // В ручном режиме объект, оказавшийся под карточкой, поднимаем над ней.
+  if (fromTap && !sensorsLive()) {
+    const card = $('card');
+    if (!card.hidden && hit.y > card.getBoundingClientRect().top - 40) centerOn(state.selection);
+  }
 }
 
 function updateSelection(ms) {
@@ -262,10 +362,12 @@ function updateSelection(ms) {
     if (!sat || !satObs) return;
     const pos = satPosition(sat, new Date(ms), satObs, frameContext(new Date(ms)));
     sel.pos = pos;
-    sel.vec = pos ? enu(pos.alt, pos.az) : null;
-    // Пролёты считаем на 5 дней вперёд и пересчитываем, только когда время ушло за этот диапазон.
-    if (!sel.passes || ms < sel.passesFrom - MIN || ms > sel.passesFrom + 3 * 24 * HOUR) {
-      sel.passes = findPasses(sat, satObs, { from: ms - 15 * MIN, days: 5, minAlt: 10, maxPasses: 16 });
+    sel.vec = pos ? enu(apparentAlt(pos.alt), pos.az) : null;
+    // Пролёты — на 5 дней вперёд; пересчёт, когда время ушло больше чем на 12 ч,
+    // так список всегда покрывает не меньше 4,5 суток.
+    if (!sel.passes || ms < sel.passesFrom - MIN || ms > sel.passesFrom + 12 * HOUR) {
+      sel.passes = findPasses(sat, satObs, { from: ms - 15 * MIN, days: 5, minAlt: 10, maxPasses: 200 })
+        .map((p) => describeVisibility(sat, p));
       sel.passesFrom = ms;
     }
     // траектория: текущий пролёт или ближайший будущий
@@ -296,72 +398,106 @@ function updateSelection(ms) {
   }
 }
 
+// Для видимого пролёта — только та часть, когда спутник освещён, а небо тёмное:
+// начало, конец и самая высокая точка в этом окне. Короче 30 с — не считаем видимым.
+function describeVisibility(sat, p) {
+  if (!p.visible || !p.visibleFrom || !p.visibleTo || p.visibleTo - p.visibleFrom < 30000) return { ...p, visible: false };
+  const at = (t) => {
+    const q = satPosition(sat, new Date(t), satObs);
+    return q ? { t, alt: q.alt, az: q.az } : null;
+  };
+  const from = at(p.visibleFrom);
+  const to = at(p.visibleTo);
+  let max = p.max.t >= p.visibleFrom && p.max.t <= p.visibleTo ? p.max : null;
+  if (!max) {
+    for (let t = p.visibleFrom; t <= p.visibleTo; t += 10000) {
+      const q = at(t);
+      if (q && (!max || q.alt > max.alt)) max = q;
+    }
+  }
+  if (!from || !to || !max) return { ...p, visible: false };
+  return { ...p, vis: { from, to, max } };
+}
+
 // ---------- карточка ----------
+// Каркас карточки (заголовок, кнопки) строится один раз при выборе объекта;
+// раз в секунду обновляется только содержимое и только если текст изменился —
+// так нажатия на ✕ и «Навести» не теряются, а прокрутка не сбрасывается.
 
 let cardTimer = 0;
+let cardBodyHtml = '';
+
+function buildCard() {
+  const el = $('card');
+  el.hidden = false;
+  el.scrollTop = 0;
+  cardBodyHtml = '';
+  $('card-body').innerHTML = '';
+  $('card-center').hidden = settings.mode !== 'manual' && sensorsLive();
+}
 
 function renderCard(force = false) {
   const sel = state.selection;
   if (!sel) return;
-  const now = skyTime();
   if (!force && performance.now() - cardTimer < 1000) return;
   cardTimer = performance.now();
+  const now = skyTime();
   const fmt = state.fmt;
   let card;
   try {
     if (sel.type === 'body') card = bodyCard(sky, sky.body(sel.id), fmt, now, state.cat);
     else if (sel.type === 'star') card = starCard(sky, state.cat, sel.index, fmt, now);
-    else if (sel.type === 'sat') {
-      const sat = state.sats[sel.index];
-      const group = TLE_GROUPS.find((g) => g.id === sat.group);
-      const visible = (sel.passes || []).filter((p) => p.visible && p.set.t > now).slice(0, 5);
-      const all = (sel.passes || []).filter((p) => p.set.t > now);
-      card = satCard(sat, sel.pos, fmt, now, {
-        passes: visible.length ? visible : all.slice(0, 3),
-        ageDays: tleAgeDays(sat, now),
-        groupTitle: group ? group.title : '',
-      });
-      card.passTitle = visible.length ? 'Видимые пролёты' : all.length ? 'Ближайшие пролёты (не видны глазом)' : null;
-      card.passEmpty = !all.length ? 'Пролётов выше 10° в ближайшие 5 дней нет.' : null;
-    }
+    else if (sel.type === 'sat') card = satCardFor(sel, now);
   } catch (err) {
     console.error(err);
     return;
   }
-  const el = $('card');
-  const scroll = el.scrollTop;
-  el.hidden = false;
-  el.innerHTML = `
-    <div class="card-head">
-      <div>
-        <h2>${esc(card.title)}</h2>
-        ${card.subtitle ? `<p class="card-sub">${esc(card.subtitle)}</p>` : ''}
-      </div>
-      <button class="round" id="card-close" type="button" aria-label="Закрыть">✕</button>
-    </div>
-    <dl class="rows">${card.rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
-    ${card.note ? `<p class="card-note">${esc(card.note)}</p>` : ''}
+  if (!card) return;
+  $('card-title').textContent = card.title;
+  $('card-sub').textContent = card.subtitle || '';
+  const rows = (list) => `<dl class="rows">${list.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>`;
+  const html = `
+    ${card.lead ? `<p class="card-lead">${esc(card.lead)}</p>` : ''}
+    ${rows(card.rows)}
     ${card.passTitle ? `<h3>${esc(card.passTitle)}</h3>
       <ul class="passes">${card.passes.map((p) => `<li class="${p.visible ? 'vis' : ''}"><b>${esc(p.when)}</b><span>${esc(p.path)}</span></li>`).join('')}</ul>` : ''}
     ${card.passEmpty ? `<p class="card-note">${esc(card.passEmpty)}</p>` : ''}
-    <div class="card-actions">
-      ${settings.mode === 'manual' ? '<button class="btn" id="card-center" type="button">Навести</button>' : ''}
-    </div>
-  `;
-  el.scrollTop = scroll;
-  $('card-close').addEventListener('click', () => select(null));
-  const c = $('card-center');
-  if (c) c.addEventListener('click', () => centerOn(state.selection));
+    ${card.extra && card.extra.length ? rows(card.extra) : ''}
+    ${card.note ? `<p class="card-note">${esc(card.note)}</p>` : ''}`;
+  if (html !== cardBodyHtml) {
+    cardBodyHtml = html;
+    $('card-body').innerHTML = html;
+  }
+}
+
+function satCardFor(sel, now) {
+  const sat = state.sats[sel.index];
+  if (!sat) return null;
+  const group = TLE_GROUPS.find((g) => g.id === sat.group);
+  const upcoming = (sel.passes || []).filter((p) => p.set.t > now);
+  const visible = upcoming.filter((p) => p.visible && p.vis && p.vis.to.t > now);
+  const next = visible[0] || null;
+  const card = satCard(sat, sel.pos, state.fmt, now, {
+    passes: (visible.length ? visible : upcoming).slice(visible.length ? 1 : 0, 6),
+    next: next || upcoming[0] || null,
+    ageDays: tleAgeDays(sat, now),
+    groupTitle: group ? group.title : '',
+  });
+  const rest = card.passes || [];
+  card.passTitle = rest.length ? (visible.length ? 'Потом видимые пролёты' : 'Пролёты (глазом не видны: в тени Земли или светло)') : null;
+  card.passEmpty = !upcoming.length ? 'Пролётов выше 10° в ближайшие 5 дней нет.' : null;
+  return card;
 }
 
 function hideCard() {
   $('card').hidden = true;
-  $('card').innerHTML = '';
+  $('card-body').innerHTML = '';
+  cardBodyHtml = '';
 }
 
 // Навести ручную карту на объект. Если открыта карточка — ставим объект над ней, а не в центр.
 function centerOn(sel) {
-  if (!sel || !sel.vec || settings.mode !== 'manual') return;
+  if (!sel || !sel.vec || sensorsLive()) return;
   const { az, alt } = altAz(sel.vec);
   const card = $('card');
   let shift = 0;
@@ -376,7 +512,7 @@ function centerOn(sel) {
 let anim = null;
 function animateTo(az, alt) {
   const from = { ...settings.manual };
-  let dAz = ((az - from.az + 540) % 360) - 180;
+  const dAz = ((az - from.az + 540) % 360) - 180;
   const t0 = performance.now();
   anim = (now) => {
     const k = Math.min(1, (now - t0) / 600);
@@ -393,8 +529,10 @@ function animateTo(az, alt) {
 // ---------- режимы ----------
 
 const MODE_NAMES = { manual: 'Вручную', sensors: 'Датчики', ar: 'AR' };
+let modeSeq = 0;
 
 async function setMode(mode, { fromGesture = false } = {}) {
+  const token = ++modeSeq; // более позднее переключение отменяет незаконченное
   hideBanner();
   if (mode === 'sensors' || mode === 'ar') {
     if (!orientationSupported()) {
@@ -402,18 +540,24 @@ async function setMode(mode, { fromGesture = false } = {}) {
       mode = 'manual';
     } else if (needsPermission() && fromGesture) {
       const res = await requestOrientationPermission();
+      if (token !== modeSeq) return;
       if (res !== 'granted') {
-        toast('Без разрешения на датчики карта не сможет поворачиваться за телефоном. Включите «Движение и ориентация» в настройках Safari.');
+        toast(MOTION_DENIED);
         mode = 'manual';
       }
     }
   }
-  if (mode !== 'manual') tracker.start();
+  if (mode === 'manual') {
+    tracker.stop();
+    state.relativeOffset = 0;
+  } else tracker.start();
   if (mode === 'ar') {
     try {
       await startCamera(video);
+      if (token !== modeSeq) return;
       document.body.classList.add('ar');
     } catch (err) {
+      if (token !== modeSeq || err.name === 'AbortError') return;
       toast(err.message);
       mode = 'sensors';
     }
@@ -425,31 +569,41 @@ async function setMode(mode, { fromGesture = false } = {}) {
   settings.mode = mode;
   saveSettings();
   $('mode-name').textContent = MODE_NAMES[mode];
-  if (state.selection) renderCard(true);
+  if (state.selection) {
+    $('card-center').hidden = mode !== 'manual';
+    renderCard(true);
+  }
   state.dirty = true;
   if (mode !== 'manual') watchSensors();
 }
+
+const MOTION_DENIED = 'Доступ к датчикам не дан — пока крутите небо пальцем. Чтобы включить: полностью закройте Safari (или приложение с экрана «Домой»), откройте снова и нажмите «Разрешить».';
 
 // Если через пару секунд данных от датчиков нет — подсказать.
 let sensorWatch = 0;
 function watchSensors() {
   clearTimeout(sensorWatch);
   sensorWatch = setTimeout(() => {
-    if (settings.mode === 'manual' || tracker.active) return;
+    if (settings.mode === 'manual' || tracker.hasData) return;
     if (needsPermission()) showBanner('Нажмите, чтобы включить датчики движения', () => setMode(settings.mode, { fromGesture: true }));
-    else showBanner('Датчики не отвечают. Перейти в ручной режим?', () => setMode('manual'));
+    else showBanner('Датчики не отвечают. Нажмите, чтобы перейти в ручной режим', () => setMode('manual'));
   }, 1800);
 }
 
-function applyView(ms) {
-  if (settings.mode === 'manual' || !tracker.active) {
+// Поправка к компасу: над настоящим компасом — сохранённая, без компаса — только на этот сеанс.
+function compassCorrection() {
+  return tracker.hasCompass ? settings.compassOffset : state.relativeOffset;
+}
+
+function applyView() {
+  if (!sensorsLive()) {
     view.projection = 'stereo';
     view.focalOverride = null;
     view.fov = settings.manual.fov;
     view.lookAt(settings.manual.az, settings.manual.alt);
     return;
   }
-  const axes = tracker.axes(state.declination, settings.compassOffset);
+  const axes = tracker.axes(state.declination, compassCorrection());
   if (axes) view.setAxes(axes.r, axes.u, axes.f);
   if (settings.mode === 'ar') {
     view.projection = 'gnomonic';
@@ -461,6 +615,27 @@ function applyView(ms) {
   }
 }
 
+// Без компаса небо может быть повёрнуто — честно говорим об этом прямо на карте.
+function renderCompassChip() {
+  const chip = $('compass-chip');
+  const show = sensorsLive() && !state.calibrating && !tracker.hasCompass;
+  chip.hidden = !show;
+  if (show) chip.textContent = tracker.waitingForCompass
+    ? 'Ловлю компас: на секунду направьте телефон на горизонт'
+    : 'Компаса нет — небо может быть повёрнуто. Выровнять';
+}
+
+// Автотема следует за настоящим Солнцем, а не за временем на шкале.
+function realSunAlt() {
+  if (state.timeOffset === 0) return sky.sunAlt;
+  const now = Date.now();
+  if (state.realSunAlt === null || now - state.realSunAt > MIN) {
+    state.realSunAlt = sky.sunAltAt(now);
+    state.realSunAt = now;
+  }
+  return state.realSunAlt;
+}
+
 // ---------- кадр ----------
 
 function frame(now) {
@@ -469,20 +644,31 @@ function frame(now) {
     anim(now);
     state.dirty = true;
   }
-  const live = settings.mode !== 'manual' && tracker.active;
-  const interval = live ? 0 : state.sats.length ? 100 : 1000;
+  const interval = sensorsLive() ? 0 : state.sats.length ? 100 : 1000;
   if (!state.dirty && now - state.lastDraw < interval) return;
   if (!state.location) return;
   state.dirty = false;
   state.lastDraw = now;
+  // Ошибка в одном кадре не должна останавливать карту навсегда.
+  try {
+    drawFrame();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+function drawFrame() {
   const ms = skyTime();
   sky.update(ms);
   if (state.cat) sky.transformStars(state.cat);
   updateSatPositions(ms);
   updateTails(ms);
-  applyView(ms);
+  applyView();
   updateSelection(ms);
-  updateNight(sky.sunAlt);
+  updateNight(realSunAlt());
+  document.body.classList.toggle('live', sensorsLive());
+  const card = $('card');
+  const cardTop = card.hidden ? view.height - 90 : card.getBoundingClientRect().top;
   renderer.draw({
     view,
     sky,
@@ -493,12 +679,13 @@ function frame(now) {
     tails: settings.layers.satellites ? state.tails : null,
     layers: settings.layers,
     theme: document.documentElement.dataset.theme === 'red' ? 'red' : 'dark',
-    mode: settings.mode === 'manual' || !tracker.active ? 'manual' : settings.mode,
+    mode: sensorsLive() ? settings.mode : 'manual',
     selection: state.selection,
-    insets: { top: 90, bottom: 150 },
+    insets: { top: 90, bottom: Math.max(90, view.height - cardTop) },
   });
   renderTime(ms);
   renderCenterHint();
+  renderCompassChip();
   renderCard();
 }
 
@@ -518,13 +705,13 @@ function renderTime(ms) {
   } else {
     const sign = off > 0 ? '+' : '−';
     const a = Math.abs(off);
-    const d = Math.floor(a / (24 * HOUR));
-    const h = Math.floor((a % (24 * HOUR)) / HOUR);
+    const d = Math.floor(a / DAY);
+    const h = Math.floor((a % DAY) / HOUR);
     const m = Math.round((a % HOUR) / MIN);
     const parts = [];
-    if (d) parts.push(`${d} д`);
-    if (h) parts.push(`${h} ч`);
-    if (m || !parts.length) parts.push(`${m} мин`);
+    if (d) parts.push(unit(d, 'сут'));
+    if (h) parts.push(unit(h, 'ч'));
+    if (m || !parts.length) parts.push(unit(m, 'мин'));
     offEl.textContent = `${sign}${parts.join(' ')}`;
     nowBtn.classList.add('active');
   }
@@ -546,7 +733,7 @@ function setNow() {
 let centerHintAt = 0;
 function renderCenterHint() {
   const el = $('center-hint');
-  if (settings.mode === 'manual' || !tracker.active) {
+  if (!sensorsLive()) {
     el.hidden = true;
     return;
   }
@@ -554,13 +741,12 @@ function renderCenterHint() {
   if (now - centerHintAt < 250) return;
   centerHintAt = now;
   const h = renderer.hitTest(view.width / 2, view.height / 2, 26);
+  el.hidden = false;
   if (!h) {
     const c = view.center;
-    el.hidden = false;
     el.textContent = `${Math.round(c.az) % 360}° ${direction8(c.az).short} · высота ${Math.round(c.alt)}°`;
     return;
   }
-  el.hidden = false;
   el.textContent = hitName(h);
 }
 
@@ -592,7 +778,7 @@ function onPointerMove(e) {
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (!gesture) return;
   if (gesture.type === 'pinch' && pointers.size === 2) {
-    if (settings.mode === 'ar') return;
+    if (settings.mode === 'ar' && sensorsLive()) return;
     const [a, b] = [...pointers.values()];
     const d = Math.hypot(a.x - b.x, a.y - b.y);
     settings.manual.fov = Math.max(20, Math.min(150, (gesture.fov0 * gesture.d0) / Math.max(20, d)));
@@ -606,14 +792,16 @@ function onPointerMove(e) {
   gesture.x = e.clientX;
   gesture.y = e.clientY;
   const degPerPx = view.effectiveFov / Math.min(view.width, view.height);
-  if (settings.mode === 'manual' || !tracker.active) {
+  if (!sensorsLive()) {
     anim = null;
     settings.manual.az = (settings.manual.az - dx * degPerPx + 360) % 360;
     settings.manual.alt = Math.max(-90, Math.min(90, settings.manual.alt + dy * degPerPx));
     state.dirty = true;
   } else if (state.calibrating) {
-    settings.compassOffset = ((settings.compassOffset - dx * degPerPx + 540) % 360) - 180;
-    $('calib-value').textContent = `${settings.compassOffset > 0 ? '+' : ''}${decimal(settings.compassOffset, 1)}°`;
+    const next = ((compassCorrection() - dx * degPerPx + 540) % 360) - 180;
+    if (tracker.hasCompass) settings.compassOffset = next;
+    else state.relativeOffset = next;
+    $('calib-value').textContent = `${next > 0 ? '+' : ''}${decimal(next, 1)}°`;
     state.dirty = true;
   }
 }
@@ -622,7 +810,7 @@ function onPointerUp(e) {
   pointers.delete(e.pointerId);
   if (gesture && gesture.type === 'tap' && pointers.size === 0) {
     const hit = renderer.hitTest(e.clientX, e.clientY);
-    select(hit);
+    select(hit, { fromTap: true });
   }
   if (pointers.size === 0) {
     if (gesture && gesture.type !== 'tap') saveSettings();
@@ -631,7 +819,7 @@ function onPointerUp(e) {
 }
 
 function onWheel(e) {
-  if (settings.mode === 'ar') return;
+  if (settings.mode === 'ar' && sensorsLive()) return;
   e.preventDefault();
   settings.manual.fov = Math.max(20, Math.min(150, settings.manual.fov * Math.exp(e.deltaY * 0.001)));
   state.dirty = true;
@@ -707,7 +895,11 @@ function bindPlaceSheet() {
   $('coords-input').addEventListener('keydown', (e) => e.key === 'Enter' && useCoords());
 }
 
+let locating = false;
+
 async function locate(fromSheet) {
+  if (locating) return false;
+  locating = true;
   const btn = fromSheet ? $('place-locate') : null;
   if (btn) {
     btn.disabled = true;
@@ -719,16 +911,12 @@ async function locate(fromSheet) {
     if (fromSheet) closeSheets();
     return true;
   } catch (err) {
-    if (fromSheet) {
-      $('place-error').hidden = false;
-      $('place-error').textContent = err.message;
-    } else {
-      $('place-error').hidden = false;
-      $('place-error').textContent = err.message;
-      openSheet('place-sheet');
-    }
+    $('place-error').hidden = false;
+    $('place-error').textContent = err.message;
+    if (!fromSheet) openSheet('place-sheet');
     return false;
   } finally {
+    locating = false;
     if (btn) {
       btn.disabled = false;
       btn.textContent = 'Определить моё место';
@@ -755,10 +943,15 @@ function renderSettings() {
   $('ar-fov').value = settings.arFov;
   $('ar-fov-value').textContent = `${settings.arFov}°`;
   const d = state.declination;
-  const comp = tracker.mode === 'ios'
-    ? `Компас iPhone${tracker.accuracy >= 0 && tracker.accuracy !== null ? `, точность ±${Math.round(tracker.accuracy)}°` : ''}`
-    : tracker.mode === 'absolute' ? 'Компас устройства' : tracker.mode === 'relative' ? 'Компаса нет — выровняйте небо вручную' : 'Датчики ещё не включены';
-  $('compass-status').textContent = `${comp}. Магнитное склонение здесь ${d >= 0 ? '+' : '−'}${decimal(Math.abs(d), 1)}° — учтено. Ручная поправка ${settings.compassOffset > 0 ? '+' : ''}${decimal(settings.compassOffset, 1)}°.`;
+  let comp;
+  if (tracker.mode === 'ios' && tracker.hasCompass) {
+    comp = `Компас iPhone${tracker.accuracy !== null && tracker.accuracy >= 0 ? `, точность ±${Math.round(tracker.accuracy)}°` : ''}`;
+  } else if (tracker.waitingForCompass) comp = 'Компас iPhone ещё не пойман — на секунду направьте телефон на горизонт';
+  else if (tracker.mode === 'absolute') comp = 'Компас устройства';
+  else if (tracker.mode === 'relative') comp = 'Компаса нет — выровняйте небо вручную';
+  else comp = 'Датчики выключены (ручной режим)';
+  const corr = compassCorrection();
+  $('compass-status').textContent = `${comp}. Магнитное склонение здесь ${d >= 0 ? '+' : '−'}${decimal(Math.abs(d), 1)}° — учтено. Ручная поправка ${corr > 0 ? '+' : ''}${decimal(corr, 1)}°.`;
   renderSatStatus();
 }
 
@@ -775,19 +968,41 @@ function renderSatStatus() {
     return;
   }
   const parts = [];
-  let oldest = null;
+  let newest = null;
+  let loaded = null;
   let errors = 0;
   for (const g of TLE_GROUPS) {
     const s = src[g.id];
     if (!s) continue;
-    if (s.fetchedAt && (!oldest || s.fetchedAt < oldest)) oldest = s.fetchedAt;
-    if (s.error && !s.count) errors++;
-    if (s.count) parts.push(`${g.title}: ${s.count}`);
+    if (s.newestEpochMs && (!newest || s.newestEpochMs > newest)) newest = s.newestEpochMs;
+    if (s.fetchedAt && (!loaded || s.fetchedAt > loaded)) loaded = s.fetchedAt;
+    if (s.error) errors++;
+    if (s.count) parts.push(`${g.title.toLowerCase()} — ${s.count}`);
   }
-  let text = parts.length ? `${parts.join(', ')}.` : 'Спутники не загружены.';
-  if (oldest) text += ` Орбиты от ${whenText(state.fmt, oldest, Date.now())}.`;
-  if (errors) text += ' Часть данных получить не удалось — нужен интернет.';
+  const now = Date.now();
+  let text = parts.length ? `Загружено: ${parts.join(', ')}.` : 'Спутники не загружены.';
+  if (newest) {
+    const days = (now - newest) / DAY;
+    text += ` Самые свежие данные орбит — от ${whenText(state.fmt, newest, now)}.`;
+    if (days > 3) text += ' Это давно: положения могут быть неточными, нужен интернет.';
+  }
+  if (loaded) text += ` Скачано ${whenText(state.fmt, loaded, now)}.`;
+  if (errors) text += ' CelesTrak ответил не на все запросы — показаны сохранённые данные.';
+  if (Object.values(src).some((s) => s.mirrorOutdated)) text += ' Запасная копия орбит на сайте устарела.';
   el.textContent = text;
+}
+
+function startCalibration() {
+  closeSheets();
+  hideBanner();
+  if (!sensorsLive()) {
+    toast('Подстройка компаса работает в режимах «Датчики» и AR.');
+    return;
+  }
+  state.calibrating = true;
+  $('calib').hidden = false;
+  const corr = compassCorrection();
+  $('calib-value').textContent = `${corr > 0 ? '+' : ''}${decimal(corr, 1)}°`;
 }
 
 function bindSettingsSheet() {
@@ -805,7 +1020,7 @@ function bindSettingsSheet() {
   document.querySelectorAll('[data-theme-mode]').forEach((b) =>
     b.addEventListener('click', () => {
       setThemeMode(b.dataset.themeMode);
-      updateNight(sky.sunAlt);
+      if (state.location) updateNight(realSunAlt());
       renderSettings();
       state.dirty = true;
     }),
@@ -816,18 +1031,10 @@ function bindSettingsSheet() {
     saveSettings();
     state.dirty = true;
   });
-  $('calib-start').addEventListener('click', () => {
-    closeSheets();
-    if (settings.mode === 'manual') {
-      toast('Подстройка компаса работает в режимах «Датчики» и AR.');
-      return;
-    }
-    state.calibrating = true;
-    $('calib').hidden = false;
-    $('calib-value').textContent = `${settings.compassOffset > 0 ? '+' : ''}${decimal(settings.compassOffset, 1)}°`;
-  });
+  $('calib-start').addEventListener('click', startCalibration);
   $('calib-reset').addEventListener('click', () => {
     settings.compassOffset = 0;
+    state.relativeOffset = 0;
     saveSettings();
     renderSettings();
     state.dirty = true;
@@ -838,6 +1045,9 @@ function bindSettingsSheet() {
     saveSettings();
   });
   $('sat-refresh').addEventListener('click', () => refreshSatellites(true));
+  $('compass-chip').addEventListener('click', () => {
+    if (!tracker.waitingForCompass) startCalibration();
+  });
 }
 
 function bindFindSheet() {
@@ -865,10 +1075,13 @@ function renderFind() {
     }
   }
   const row = (o) => `<li><button type="button" data-find='${esc(JSON.stringify({ type: o.type, id: o.id, index: o.index }))}'>
-      <b>${esc(o.name)}</b><span>${esc(o.alt > -0.5 ? `${Math.round(o.alt)}° · ${direction8(o.az).nom}` : 'под горизонтом')}${o.sunlit === false && o.alt > 0 ? ' · в тени' : ''}</span></button></li>`;
+      <b>${esc(o.name)}</b><span>${esc(o.alt > -0.5 ? `${Math.round(o.alt)}° · ${direction8(o.az).nom}` : 'под горизонтом')}${o.sunlit === false && o.alt > 0 ? ' · в тени Земли' : ''}</span></button></li>`;
+  const satsHtml = items.some((o) => o.type === 'sat')
+    ? `<h3>Спутники</h3><ul class="pick">${items.filter((o) => o.type === 'sat').map(row).join('')}</ul>`
+    : `<h3>Спутники</h3><p class="muted">${state.satLoading ? 'Загружаю орбиты…' : 'Орбиты спутников не загружены — нужен интернет.'}</p>`;
   $('find-list').innerHTML = `
     <h3>Солнечная система</h3><ul class="pick">${items.filter((o) => o.type === 'body').map(row).join('')}</ul>
-    ${items.some((o) => o.type === 'sat') ? `<h3>Спутники</h3><ul class="pick">${items.filter((o) => o.type === 'sat').map(row).join('')}</ul>` : ''}
+    ${satsHtml}
     ${stars.length ? `<h3>Яркие звёзды</h3><ul class="pick">${stars.sort((a, b) => b.alt - a.alt).map(row).join('')}</ul>` : ''}
   `;
   $('find-list').querySelectorAll('[data-find]').forEach((b) =>
@@ -889,7 +1102,7 @@ function toast(text) {
   el.textContent = text;
   el.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (el.hidden = true), 5000);
+  toastTimer = setTimeout(() => (el.hidden = true), 6000);
 }
 
 let bannerAction = null;
@@ -912,23 +1125,43 @@ function finishWelcome() {
   storage.set('welcome-done-v1', true);
 }
 
+let starting = false;
+
 function bindWelcome() {
-  $('start-btn').addEventListener('click', () => {
+  const startBtn = $('start-btn');
+  const manualBtn = $('manual-start');
+  const busy = (on, text) => {
+    startBtn.disabled = on;
+    manualBtn.disabled = on;
+    startBtn.textContent = on ? text : 'Начать';
+  };
+  startBtn.addEventListener('click', () => {
+    if (starting) return;
+    starting = true;
     // На iOS разрешение на датчики — строго внутри нажатия, до любых await.
     const perm = requestOrientationPermission();
-    const loc = locate(false);
-    perm.then(async (res) => {
-      const ok = await loc;
-      const mode = res === 'granted' && orientationSupported() ? 'sensors' : 'manual';
-      if (res === 'denied') toast('Без датчиков — крутите небо пальцем. Включить их можно позже кнопкой режима.');
-      await setMode(mode);
-      if (ok) finishWelcome();
+    busy(true, 'Определяю место…');
+    // Датчики включаем, как только ответили про разрешение, не дожидаясь геолокации.
+    perm.then((res) => {
+      if (res === 'denied') toast(MOTION_DENIED);
+      return setMode(res === 'granted' && orientationSupported() ? 'sensors' : 'manual');
     });
+    locate(false)
+      .then((ok) => ok && finishWelcome())
+      .finally(() => {
+        starting = false;
+        busy(false);
+      });
   });
-  $('manual-start').addEventListener('click', async () => {
+  manualBtn.addEventListener('click', async () => {
+    if (starting) return;
+    starting = true;
+    busy(true, 'Определяю место…');
     await setMode('manual');
     const ok = await locate(false);
     if (ok) finishWelcome();
+    starting = false;
+    busy(false);
   });
 }
 
@@ -937,6 +1170,23 @@ function bindWelcome() {
 function registerServiceWorker() {
   if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
   navigator.serviceWorker.register('sw.js').catch((err) => console.warn('Офлайн-режим недоступен', err));
+}
+
+function retryCatalog() {
+  if (state.cat) return;
+  loadCatalog()
+    .then((cat) => {
+      state.cat = cat;
+      state.dirty = true;
+    })
+    .catch((err) => toast(`Каталог звёзд не загрузился (${err.message}). Попробую ещё раз, когда появится связь.`));
+}
+
+function satellitesStale() {
+  const src = state.satSources;
+  if (!src || !state.sats.length) return true;
+  // данные с зеркала сайта устаревают быстрее: после них снова пробуем CelesTrak
+  return Object.values(src).some((s) => !s.fetchedAt || Date.now() - s.fetchedAt > (s.from === 'mirror' ? 2 : 12) * HOUR);
 }
 
 function boot() {
@@ -951,6 +1201,8 @@ function boot() {
   canvas.addEventListener('wheel', onWheel, { passive: false });
   document.querySelectorAll('[data-step]').forEach((b) => b.addEventListener('click', () => shiftTime(Number(b.dataset.step))));
   $('now-btn').addEventListener('click', setNow);
+  $('card-close').addEventListener('click', () => select(null));
+  $('card-center').addEventListener('click', () => centerOn(state.selection));
   bindTimeScrub();
   bindPlaceSheet();
   bindModeSheet();
@@ -962,19 +1214,20 @@ function boot() {
   $('banner').addEventListener('click', () => bannerAction && bannerAction());
   document.addEventListener('visibilitychange', () => {
     state.dirty = true;
-    if (!document.hidden) {
-      const src = state.satSources;
-      const stale = !src || Object.values(src).some((s) => !s.fetchedAt || Date.now() - s.fetchedAt > 12 * HOUR);
-      if (stale) refreshSatellites();
-    }
+    if (document.hidden) return;
+    retryCatalog();
+    if (satellitesStale()) refreshSatellites();
   });
+  window.addEventListener('online', () => {
+    retryCatalog();
+    refreshSatellites();
+  });
+  // Пока спутников нет — тихо пробуем раз в 10 минут.
+  setInterval(() => {
+    if (!document.hidden && !state.sats.length) refreshSatellites();
+  }, 10 * MIN);
 
-  loadCatalog()
-    .then((cat) => {
-      state.cat = cat;
-      state.dirty = true;
-    })
-    .catch((err) => toast(`Каталог звёзд не загрузился: ${err.message}`));
+  retryCatalog();
   refreshSatellites();
 
   const saved = getSavedLocation();
@@ -982,6 +1235,7 @@ function boot() {
   if (saved && storage.get('welcome-done-v1')) {
     $('welcome').hidden = true;
     setMode(settings.mode);
+    refreshGpsOnLaunch(saved);
   } else {
     $('welcome').hidden = false;
   }

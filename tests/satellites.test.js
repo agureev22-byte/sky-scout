@@ -21,6 +21,12 @@ import {
   track,
   findPasses,
   tleAgeDays,
+  TLE_MIN_INTERVAL_MS,
+  TLE_MAX_AGE_MS,
+  TLE_MIRROR_MAX_AGE_MS,
+  TLE_MIRROR_MAX_EPOCH_AGE_MS,
+  TLE_RETRY_AFTER_MS,
+  TLE_RETRY_AFTER_TIMEOUT_MS,
 } from '../js/satellites.js';
 
 const FIXTURE = readFileSync(new URL('./fixtures/tle-test.txt', import.meta.url), 'utf8');
@@ -280,6 +286,31 @@ const TEXT = {
   visual: tle(0, 1, 4), // МКС и Хаббл тоже есть в «ярких» — дубли
   starlink: tle(3, 0), // дубль МКС (для проверки приоритета)
 };
+const EPOCH = Date.UTC(2026, 8, 25, 12); // эпоха всех орбит фикстуры (26268.5)
+
+// Меняет эпоху в строках 1 (поле из 14 символов, например '26260.50000000') и пересчитывает контрольную сумму.
+const retime = (text, epoch) =>
+  text
+    .split('\n')
+    .map((l) => {
+      if (!l.startsWith('1 ')) return l;
+      const body = l.slice(0, 18) + epoch + l.slice(32, 68);
+      return body + checksum(body);
+    })
+    .join('\n');
+
+// Временно подменяет globalThis.navigator (в Node 21+ это настраиваемый геттер).
+async function withNavigator(value, fn) {
+  const desc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true });
+  try {
+    return await fn();
+  } finally {
+    if (desc) Object.defineProperty(globalThis, 'navigator', desc);
+    else delete globalThis.navigator;
+  }
+}
+const isNet = (u) => u.startsWith('https://celestrak.org/');
 
 function fakeFetch(routes, calls = []) {
   return async (url) => {
@@ -334,7 +365,13 @@ test('loadSatellites: network ok → from network, cached, deduped by group prio
     assert.equal(res.sources[g].from, 'network');
     assert.equal(res.sources[g].fetchedAt, now);
     assert.equal(res.sources[g].error, null);
+    assert.equal(res.sources[g].skippedFresh, false);
+    assert.equal(res.sources[g].mirrorOutdated, false);
+    assert.equal(res.sources[g].newestEpochMs, EPOCH);
+    assert.equal(res.sources[g].oldestEpochMs, EPOCH);
     assert.equal(store.getMeta(g).fetchedAt, now);
+    assert.equal(store.getMeta(g).from, 'network');
+    assert.equal(store.getMeta(g).netOkAt, now);
     assert.equal(store.getText(g), TEXT[g]);
   }
   assert.equal(res.sources.visual.count, 3);
@@ -377,10 +414,20 @@ test('loadSatellites: network ok → from network, cached, deduped by group prio
   assert.equal(res3.sources.stations.from, 'network');
   assert.equal(res3.sats.length, 1);
 
-  // force: загрузка даже при свежем кэше.
+  // force через час после загрузки с CelesTrak: CelesTrak просит не чаще раза в 2 ч — в сеть не ходим.
   const calls4 = [];
-  await loadSatellites({ store, groups: ['hubble'], force: true, now: now + 3600e3, fetchImpl: fakeFetch((url) => ({ body: TEXT.hubble }), calls4) });
+  const hubbleOk = fakeFetch(() => ({ body: TEXT.hubble }), calls4);
+  const res4 = await loadSatellites({ store, groups: ['hubble'], force: true, now: now + 3600e3, fetchImpl: hubbleOk });
+  assert.equal(calls4.length, 0);
+  assert.equal(res4.sources.hubble.skippedFresh, true);
+  assert.equal(res4.sources.hubble.from, 'cache');
+  assert.equal(res4.sources.hubble.error, null);
+  assert.equal(res4.sources.hubble.fetchedAt, now);
+  // force через 2,5 ч: загрузка, хотя по 12-часовому правилу кэш ещё свежий.
+  const res5 = await loadSatellites({ store, groups: ['hubble'], force: true, now: now + 2.5 * 3600e3, fetchImpl: hubbleOk });
   assert.equal(calls4.length, 1);
+  assert.equal(res5.sources.hubble.from, 'network');
+  assert.equal(res5.sources.hubble.skippedFresh, false);
 });
 
 test('loadSatellites: CelesTrak fails (network error, 403 text, CORS) → mirror', async () => {
@@ -404,7 +451,14 @@ test('loadSatellites: CelesTrak fails (network error, 403 text, CORS) → mirror
     assert.equal(res.sources[g].from, 'mirror', g);
     assert.equal(res.sources[g].error, null);
     assert.equal(typeof res.sources[g].networkError, 'string');
+    assert.equal(res.sources[g].newestEpochMs, EPOCH);
+    assert.equal(res.sources[g].mirrorOutdated, false); // орбитам полсуток
     assert.equal(store.getText(g), TEXT[g]);
+    // Отметка об ошибке CelesTrak не стёрта загрузкой копии.
+    assert.equal(store.getMeta(g).from, 'mirror', g);
+    assert.equal(store.getMeta(g).failedAt, T0, g);
+    assert.equal(store.getMeta(g).retryAfterMs, TLE_RETRY_AFTER_MS, g);
+    assert.equal(store.getMeta(g).netOkAt, undefined, g);
   }
   // У Starlink копии на сайте нет: данных нет, ошибка записана.
   assert.equal(res.sources.starlink.from, null);
@@ -459,16 +513,22 @@ test('loadSatellites: after a CelesTrak failure it is not asked again for 30 min
   let res = await loadSatellites({ ...opts, now: T0 });
   assert.equal(calls.filter((u) => u.startsWith('https://celestrak.org/')).length, 2);
   assert.equal(store.getMeta('starlink').failedAt, T0);
+  assert.equal(store.getMeta('starlink').retryAfterMs, TLE_RETRY_AFTER_MS);
   assert.equal(res.sources.starlink.from, null);
+  assert.equal(res.sources.starlink.newestEpochMs, null);
+  assert.equal(res.sources.starlink.oldestEpochMs, null);
 
   calls.length = 0;
   res = await loadSatellites({ ...opts, now: T0 + 10 * 60000 });
   assert.deepEqual(calls, ['data/tle/hubble.txt']); // только копия на сайте
   assert.ok(res.sources.starlink.error);
 
+  // force паузу не отменяет: CelesTrak не спрашиваем, копию на сайте — пробуем.
   calls.length = 0;
-  await loadSatellites({ ...opts, now: T0 + 10 * 60000, force: true });
-  assert.equal(calls.filter((u) => u.startsWith('https://celestrak.org/')).length, 2);
+  res = await loadSatellites({ ...opts, now: T0 + 10 * 60000, force: true });
+  assert.deepEqual(calls, ['data/tle/hubble.txt']);
+  assert.match(res.sources.starlink.error, /недавно был недоступен/);
+  assert.equal(res.sources.starlink.skippedFresh, false);
 
   calls.length = 0;
   const ok = fakeFetch((url) => ({ body: TEXT[groupOf(url).g] }), calls);
@@ -497,6 +557,244 @@ test('loadSatellites: mirror older than cache is ignored', async () => {
   assert.ok(res.sources.hubble.error);
   assert.equal(store.getText('hubble'), TEXT.hubble);
   assert.equal(res.sats[0].epochMs, Date.UTC(2026, 8, 25, 12));
+});
+
+test('loadSatellites: exported timing constants', () => {
+  assert.equal(TLE_MIN_INTERVAL_MS, 2 * 3600e3);
+  assert.equal(TLE_MAX_AGE_MS, 12 * 3600e3);
+  assert.equal(TLE_MIRROR_MAX_AGE_MS, 2 * 3600e3);
+  assert.equal(TLE_MIRROR_MAX_EPOCH_AGE_MS, 7 * 86400e3);
+  assert.equal(TLE_RETRY_AFTER_MS, 30 * 60e3);
+  assert.equal(TLE_RETRY_AFTER_TIMEOUT_MS, 3 * 60e3);
+});
+
+test('loadSatellites: newestEpochMs / oldestEpochMs describe the orbits, not the download', async () => {
+  const store = createMemoryStore();
+  const visual = tle(0, 1) + retime(tle(4), '26265.25000000'); // ступень — орбита от 22.09 06:00
+  const fetchImpl = fakeFetch((url) => {
+    const { net, g } = groupOf(url);
+    return net && g === 'visual' ? { body: visual } : null;
+  });
+  const res = await loadSatellites({ store, now: T0, groups: ['visual', 'starlink'], fetchImpl });
+  assert.equal(res.sources.visual.fetchedAt, T0);
+  assert.equal(res.sources.visual.newestEpochMs, EPOCH);
+  assert.equal(res.sources.visual.oldestEpochMs, Date.UTC(2026, 8, 22, 6));
+  assert.equal(res.sources.starlink.count, 0);
+  assert.equal(res.sources.starlink.newestEpochMs, null);
+  assert.equal(res.sources.starlink.oldestEpochMs, null);
+  // Из кэша — те же значения; первый onUpdate (кэш) их тоже содержит.
+  const updates = [];
+  const again = await loadSatellites({
+    store,
+    now: T0 + 3600e3,
+    groups: ['visual'],
+    fetchImpl: fakeFetch(() => null),
+    onUpdate: (r) => updates.push(r),
+  });
+  assert.equal(again.sources.visual.from, 'cache');
+  assert.equal(updates[0].sources.visual.newestEpochMs, EPOCH);
+  assert.equal(again.sources.visual.oldestEpochMs, Date.UTC(2026, 8, 22, 6));
+});
+
+test('loadSatellites: force skips groups downloaded from CelesTrak < 2 h ago and honours the backoff', async () => {
+  const store = createMemoryStore();
+  const calls = [];
+  let up = true;
+  const fetchImpl = fakeFetch((url) => {
+    const { net, g } = groupOf(url);
+    if (up) return { body: TEXT[g] };
+    return net ? { status: 503, body: 'Service Unavailable' } : null;
+  }, calls);
+  const opts = { store, groups: ['stations', 'starlink'], fetchImpl, force: true };
+  await loadSatellites({ store, groups: ['stations'], fetchImpl, now: T0 });
+  assert.equal(calls.length, 1);
+
+  // Через час «Обновить»: станции свежие (скачаны час назад), Starlink ещё не загружался.
+  calls.length = 0;
+  let res = await loadSatellites({ ...opts, now: T0 + 60 * 60000 });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /GROUP=starlink/);
+  assert.equal(res.sources.stations.skippedFresh, true);
+  assert.equal(res.sources.stations.from, 'cache');
+  assert.equal(res.sources.stations.error, null);
+  assert.equal(res.sources.starlink.skippedFresh, false);
+  assert.equal(res.sources.starlink.from, 'network');
+
+  // Ещё раз через минуту до 2 ч: обе группы свежие, в сеть не ходим совсем (и в копию тоже).
+  calls.length = 0;
+  res = await loadSatellites({ ...opts, now: T0 + 119 * 60000 });
+  assert.equal(calls.length, 0);
+  assert.ok(Object.values(res.sources).every((s) => s.skippedFresh && s.from === 'cache' && s.error === null));
+  assert.equal(res.sats.length, 3);
+
+  // Через 3 ч CelesTrak отвечает 503: ошибка запоминается на 30 минут.
+  up = false;
+  calls.length = 0;
+  const tFail = T0 + 181 * 60000;
+  res = await loadSatellites({ ...opts, now: tFail });
+  assert.equal(calls.filter(isNet).length, 2);
+  assert.equal(res.sources.stations.from, 'cache');
+  assert.equal(res.sources.stations.skippedFresh, false);
+  assert.ok(res.sources.stations.error);
+  assert.equal(store.getMeta('starlink').failedAt, tFail);
+  assert.equal(store.getMeta('starlink').retryAfterMs, TLE_RETRY_AFTER_MS);
+
+  // Повторное нажатие через 5 минут: CelesTrak на паузе даже при force, копию на сайте пробуем.
+  calls.length = 0;
+  res = await loadSatellites({ ...opts, now: tFail + 5 * 60000 });
+  assert.deepEqual(calls, ['data/tle/stations.txt']);
+  assert.match(res.sources.starlink.error, /недавно был недоступен/);
+
+  // Пауза прошла — спрашиваем снова.
+  up = true;
+  calls.length = 0;
+  res = await loadSatellites({ ...opts, now: tFail + TLE_RETRY_AFTER_MS });
+  assert.equal(calls.filter(isNet).length, 2);
+  assert.equal(res.sources.starlink.from, 'network');
+
+  // Старая meta без поля from ({fetchedAt} прежних версий) считается загрузкой с CelesTrak.
+  const legacy = createMemoryStore({ hubble: { text: TEXT.hubble, fetchedAt: T0 - 30 * 60000 } });
+  const calls2 = [];
+  res = await loadSatellites({ store: legacy, groups: ['hubble'], force: true, now: T0, fetchImpl: fakeFetch(() => ({ body: TEXT.hubble }), calls2) });
+  assert.equal(calls2.length, 0);
+  assert.equal(res.sources.hubble.skippedFresh, true);
+});
+
+test('loadSatellites: backoff is 3 min after a timeout, 30 min after HTTP 403/429/5xx or TypeError online', async () => {
+  const cases = [
+    ['AbortError', () => new DOMException('The operation was aborted.', 'AbortError'), TLE_RETRY_AFTER_TIMEOUT_MS],
+    ['TimeoutError', () => new DOMException('The operation timed out.', 'TimeoutError'), TLE_RETRY_AFTER_TIMEOUT_MS],
+    ['403', () => ({ status: 403, body: 'Forbidden' }), TLE_RETRY_AFTER_MS],
+    ['429', () => ({ status: 429, body: 'Too Many Requests' }), TLE_RETRY_AFTER_MS],
+    ['503', () => ({ status: 503, body: '' }), TLE_RETRY_AFTER_MS],
+    ['TypeError', () => new TypeError('Failed to fetch'), TLE_RETRY_AFTER_MS],
+  ];
+  for (const [name, fail, delay] of cases) {
+    const store = createMemoryStore();
+    const calls = [];
+    const opts = { store, groups: ['starlink'] };
+    await withNavigator({ onLine: true }, () => loadSatellites({ ...opts, now: T0, fetchImpl: fakeFetch(fail, calls) }));
+    assert.equal(calls.length, 1, name);
+    assert.equal(store.getMeta('starlink').failedAt, T0, name);
+    assert.equal(store.getMeta('starlink').retryAfterMs, delay, name);
+    // За секунду до конца паузы CelesTrak не спрашиваем (и по кнопке «Обновить» тоже).
+    const res = await loadSatellites({ ...opts, now: T0 + delay - 1000, force: true, fetchImpl: fakeFetch(fail, calls) });
+    assert.equal(calls.length, 1, name);
+    assert.match(res.sources.starlink.error, /недавно был недоступен/, name);
+    // После паузы — спрашиваем; успешная загрузка снимает отметку.
+    const ok = await loadSatellites({ ...opts, now: T0 + delay, fetchImpl: fakeFetch(() => ({ body: TEXT.starlink }), calls) });
+    assert.equal(calls.length, 2, name);
+    assert.equal(ok.sources.starlink.from, 'network', name);
+    assert.equal(store.getMeta('starlink').failedAt, undefined, name);
+  }
+});
+
+test('loadSatellites: failures while the device is offline are not remembered', async () => {
+  const store = createMemoryStore();
+  const calls = [];
+  const opts = { store, groups: ['stations'] };
+  for (const fail of [() => new TypeError('Failed to fetch'), () => new DOMException('aborted', 'AbortError')]) {
+    const res = await withNavigator({ onLine: false }, () => loadSatellites({ ...opts, now: T0, fetchImpl: fakeFetch(fail, calls) }));
+    assert.equal(res.sources.stations.from, null);
+    assert.ok(res.sources.stations.error);
+    assert.equal(store.getMeta('stations'), null);
+  }
+  assert.equal(calls.filter(isNet).length, 2);
+  // Сеть появилась через минуту — CelesTrak спрашиваем сразу.
+  calls.length = 0;
+  const res = await withNavigator({ onLine: true }, () =>
+    loadSatellites({ ...opts, now: T0 + 60000, fetchImpl: fakeFetch(() => ({ body: TEXT.stations }), calls) }),
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(res.sources.stations.from, 'network');
+});
+
+test('loadSatellites: mirror data keeps the CelesTrak failure mark and goes stale after 2 h', async () => {
+  const store = createMemoryStore();
+  const calls = [];
+  let celestrakUp = false;
+  const fetchImpl = fakeFetch((url) => {
+    const { net, g } = groupOf(url);
+    if (net) return celestrakUp ? { body: TEXT[g] } : { status: 403, body: 'Forbidden' };
+    return { body: TEXT[g] };
+  }, calls);
+  const opts = { store, groups: ['hubble'], fetchImpl };
+
+  let res = await loadSatellites({ ...opts, now: T0 });
+  assert.equal(res.sources.hubble.from, 'mirror');
+  assert.deepEqual(store.getMeta('hubble'), { fetchedAt: T0, from: 'mirror', failedAt: T0, retryAfterMs: TLE_RETRY_AFTER_MS });
+
+  // «Обновить» через 10 минут: CelesTrak на паузе, копию перечитываем, отметка об ошибке остаётся.
+  calls.length = 0;
+  const t1 = T0 + 10 * 60000;
+  res = await loadSatellites({ ...opts, now: t1, force: true });
+  assert.deepEqual(calls, ['data/tle/hubble.txt']);
+  assert.equal(res.sources.hubble.skippedFresh, false);
+  assert.equal(store.getMeta('hubble').fetchedAt, t1);
+  assert.equal(store.getMeta('hubble').failedAt, T0);
+
+  // Через час без force: копия ещё свежая (< 2 ч) — никуда не ходим.
+  calls.length = 0;
+  res = await loadSatellites({ ...opts, now: T0 + 60 * 60000 });
+  assert.equal(calls.length, 0);
+  assert.equal(res.sources.hubble.from, 'cache');
+
+  // «Обновить» через час: пауза после ошибки прошла — CelesTrak спрашиваем снова.
+  const t2 = T0 + 60 * 60000;
+  res = await loadSatellites({ ...opts, now: t2, force: true });
+  assert.equal(calls.filter(isNet).length, 1);
+  assert.equal(res.sources.hubble.from, 'mirror');
+  assert.equal(store.getMeta('hubble').failedAt, t2);
+
+  // Через 2 ч после загрузки копии (а не через 12) — снова CelesTrak, теперь успешно.
+  celestrakUp = true;
+  calls.length = 0;
+  const t3 = t2 + TLE_MIRROR_MAX_AGE_MS + 60000;
+  res = await loadSatellites({ ...opts, now: t3 });
+  assert.equal(calls.length, 1);
+  assert.ok(isNet(calls[0]));
+  assert.equal(res.sources.hubble.from, 'network');
+  assert.deepEqual(store.getMeta('hubble'), { fetchedAt: t3, from: 'network', netOkAt: t3 });
+});
+
+test('loadSatellites: mirror with orbits older than 7 days — rejected if the cache is newer, else accepted and marked', async () => {
+  const old = retime(TEXT.hubble, '26260.50000000'); // 17.09.2026 12:00 — на момент T0 8,5 суток
+  const older = retime(TEXT.hubble, '26250.50000000'); // 07.09.2026 12:00
+  const netDown = (mirrorBody) => fakeFetch((url) => (groupOf(url).net ? { status: 503, body: '' } : { body: mirrorBody }));
+
+  // Кэша нет — принимаем с пометкой; пометка сохраняется и при чтении из кэша.
+  let store = createMemoryStore();
+  let res = await loadSatellites({ store, now: T0, groups: ['hubble'], fetchImpl: netDown(old) });
+  assert.equal(res.sources.hubble.from, 'mirror');
+  assert.equal(res.sources.hubble.error, null);
+  assert.equal(res.sources.hubble.mirrorOutdated, true);
+  assert.equal(res.sources.hubble.newestEpochMs, Date.UTC(2026, 8, 17, 12));
+  res = await loadSatellites({ store, now: T0 + 60000, groups: ['hubble'], fetchImpl: netDown(old) });
+  assert.equal(res.sources.hubble.from, 'cache');
+  assert.equal(res.sources.hubble.mirrorOutdated, true);
+
+  // В кэше ещё более старые орбиты — копию принимаем, с пометкой.
+  store = createMemoryStore({ hubble: { text: older, fetchedAt: T0 - 20 * 3600e3 } });
+  res = await loadSatellites({ store, now: T0, groups: ['hubble'], fetchImpl: netDown(old) });
+  assert.equal(res.sources.hubble.from, 'mirror');
+  assert.equal(res.sources.hubble.mirrorOutdated, true);
+  assert.equal(store.getText('hubble'), old);
+
+  // В кэше орбиты новее — копию отвергаем, кэш остаётся.
+  store = createMemoryStore({ hubble: { text: TEXT.hubble, fetchedAt: T0 - 20 * 3600e3 } });
+  res = await loadSatellites({ store, now: T0, groups: ['hubble'], fetchImpl: netDown(old) });
+  assert.equal(res.sources.hubble.from, 'cache');
+  assert.match(res.sources.hubble.error, /старее/);
+  assert.equal(res.sources.hubble.mirrorOutdated, false);
+  assert.equal(res.sources.hubble.newestEpochMs, EPOCH);
+  assert.equal(store.getText('hubble'), TEXT.hubble);
+
+  // Свежая копия — без пометки; старые орбиты с CelesTrak пометку «копия» не получают.
+  res = await loadSatellites({ store: createMemoryStore(), now: T0, groups: ['hubble'], fetchImpl: netDown(TEXT.hubble) });
+  assert.equal(res.sources.hubble.mirrorOutdated, false);
+  res = await loadSatellites({ store: createMemoryStore(), now: T0, groups: ['hubble'], fetchImpl: fakeFetch(() => ({ body: old })) });
+  assert.equal(res.sources.hubble.from, 'network');
+  assert.equal(res.sources.hubble.mirrorOutdated, false);
 });
 
 test('performance: satPosition µs per call (informational)', (t) => {

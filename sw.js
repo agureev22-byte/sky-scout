@@ -1,9 +1,9 @@
 // Сервис-воркер: приложение, каталог городов и расчёты неба работают без интернета.
 // Орбиты спутников (TLE) и погоду кэширует само приложение с отметкой времени, здесь их не трогаем.
-// Черновик экрана «вердикт» (verdict.html) кэшируется по мере открытия.
+// Черновик экрана «вердикт» (verdict.html) и его скрипты кэшируются, когда их откроют со связью.
 // При изменении любого файла приложения увеличьте VERSION — телефоны скачают новую версию.
 
-const VERSION = 'v2';
+const VERSION = 'v3';
 const CACHE = `sky-scout-${VERSION}`;
 
 const APP_FILES = [
@@ -62,14 +62,27 @@ self.addEventListener('fetch', (event) => {
   // Зеркало орбит спутников обновляется раз в сутки — его кэширует само приложение.
   if (url.pathname.includes('/data/tle/')) return;
 
-  // Страница: из кэша той же версии, что и скрипты (иначе новая разметка может встретить старый код).
+  // Страница: точное совпадение из кэша той же версии, что и скрипты (иначе новая разметка
+  // может встретить старый код). Других страниц (например, verdict.html) в кэше нет —
+  // их берём из сети и сохраняем; без сети для главной отдаём сохранённую главную.
   if (req.mode === 'navigate') {
     event.respondWith(
       caches.open(CACHE).then((cache) =>
-        cache
-          .match(req, { ignoreSearch: true })
-          .then((hit) => hit || cache.match('index.html'))
-          .then((hit) => hit || fetch(req)),
+        cache.match(req, { ignoreSearch: true }).then(
+          (hit) =>
+            hit ||
+            fetch(req)
+              .then((res) => {
+                if (res.ok && res.type === 'basic') cache.put(req, res.clone());
+                return res;
+              })
+              .catch(() => {
+                const scope = new URL(self.registration.scope).pathname;
+                const path = new URL(req.url).pathname;
+                if (path === scope || path === `${scope}index.html`) return cache.match('index.html');
+                return cache.match(req, { ignoreSearch: true }).then((r) => r || Response.error());
+              }),
+        ),
       ),
     );
     return;
