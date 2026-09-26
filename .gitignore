@@ -1,3 +1,8 @@
+# Служебные файлы наблюдателя
+_watch.py
+_watch.log
+
+# Локальные зависимости для инструментов (tools/*.mjs)
 node_modules/
 .DS_Store
 *.log
