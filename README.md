@@ -48,6 +48,7 @@ iPhone отдаёт углы поворота от случайного напр
 ```sh
 npm test                      # модульные тесты (node --test)
 node tools/preview.mjs out/   # Chromium с эмуляцией iPhone: датчики, камера, спутники, скриншоты
+REAL_TLE=1 node tools/preview.mjs out/   # то же на настоящих орбитах из data/tle/
 ```
 
 ## Данные и лицензии

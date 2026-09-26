@@ -41,6 +41,17 @@ const base = `http://127.0.0.1:${server.address().port}/`;
 const fixturePath = path.join(root, 'tests/fixtures/tle-test.txt');
 const fixture = existsSync(fixturePath) ? await readFile(fixturePath, 'utf8') : '';
 // Разделяем фикстуру: Starlink отдельно, остальное — «станции/яркие».
+// REAL_TLE=1 — отдавать настоящую копию орбит из data/tle/ (её обновляет GitHub Action).
+async function realTle(url) {
+  const group = url.includes('CATNR=20580') ? 'hubble' : url.includes('GROUP=visual') ? 'visual' : url.includes('GROUP=stations') ? 'stations' : null;
+  if (!group) return '';
+  try {
+    return await readFile(path.join(root, `data/tle/${group}.txt`), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
 function tleFor(url) {
   const lines = fixture.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith('#'));
   const groups = [];
@@ -78,9 +89,12 @@ async function newPage({ time, lat = 41.39, lon = 2.17, camera = false }) {
   });
   await page.clock.install({ time: new Date(time) });
   await page.clock.resume();
-  await page.route('https://celestrak.org/**', (route) =>
-    route.fulfill({ contentType: 'text/plain', body: tleFor(route.request().url()) }),
-  );
+  await page.route('https://celestrak.org/**', async (route) => {
+    const url = route.request().url();
+    const body = process.env.REAL_TLE ? await realTle(url) : tleFor(url);
+    if (!body.trim()) return route.fulfill({ status: 404, body: 'No GP data found' });
+    return route.fulfill({ contentType: 'text/plain', body });
+  });
   await page.route('https://geocoding-api.open-meteo.com/**', (route) =>
     route.fulfill({ contentType: 'application/json', body: JSON.stringify({ results: [{ name: 'Теруэль', latitude: 40.34, longitude: -1.1, elevation: 915, admin1: 'Арагон', country: 'Испания', timezone: 'Europe/Madrid' }] }) }),
   );
