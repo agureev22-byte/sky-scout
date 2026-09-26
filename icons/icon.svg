@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#04060c"/>
+      <stop offset="1" stop-color="#101a38"/>
+    </linearGradient>
+    <mask id="crescent">
+      <rect width="512" height="512" fill="#000"/>
+      <circle cx="286" cy="206" r="104" fill="#fff"/>
+      <circle cx="330" cy="172" r="92" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="512" height="512" fill="url(#sky)"/>
+  <rect width="512" height="512" fill="#e9eeff" mask="url(#crescent)"/>
+  <g fill="#e9eeff">
+    <circle cx="150" cy="140" r="7"/>
+    <circle cx="372" cy="296" r="6"/>
+    <circle cx="112" cy="250" r="4"/>
+    <circle cx="404" cy="120" r="4"/>
+    <path d="M186 300 l7 17 17 7 -17 7 -7 17 -7 -17 -17 -7 17 -7z"/>
+  </g>
+  <path d="M0 512 V404 L96 346 L168 386 L262 318 L360 392 L430 356 L512 398 V512 Z" fill="#070b18"/>
+  <path d="M0 404 L96 346 L168 386 L262 318 L360 392 L430 356 L512 398" fill="none" stroke="#2b3a6e" stroke-width="6" stroke-linejoin="round"/>
+</svg>

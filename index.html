@@ -1,33 +1,175 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Небесный разведчик</title>
-<style>
-  :root { color-scheme: dark; --bg:#07090f; --fg:#e8eaf2; --dim:#8a90a6; --accent:#c9d4ff; }
-  * { box-sizing:border-box; }
-  body { margin:0; min-height:100dvh; background:var(--bg); color:var(--fg);
-         font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-         display:flex; align-items:center; justify-content:center; padding:24px; text-align:center; }
-  .card { max-width:32rem; }
-  h1 { font-size:1.6rem; margin:0 0 .6rem; letter-spacing:.01em; }
-  p { color:var(--dim); margin:.4rem 0; }
-  ul { text-align:left; color:var(--dim); margin:1.2rem auto 0; max-width:26rem; padding-left:1.1rem; }
-  li { margin:.35rem 0; }
-  .dot { color:var(--accent); }
-</style>
+<meta name="description" content="Живая карта неба: наведите iPhone на небо — спутники, планеты, Солнце, Луна, звёзды и созвездия там, где они на самом деле.">
+<meta name="theme-color" content="#02040a">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Разведчик">
+<meta name="format-detection" content="telephone=no">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="css/sky.css">
+<script>
+  // Тема до отрисовки: ночью сразу красная, чтобы экран не ослепил.
+  (function () {
+    try {
+      var m = JSON.parse(localStorage.getItem('sky-scout:theme-v1'));
+      var h = new Date().getHours();
+      var t = m === 'red' || m === 'dark' ? m : (h >= 20 || h < 7 ? 'red' : 'dark');
+      document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  })();
+</script>
+<script type="module" src="js/sky/main.js"></script>
 </head>
 <body>
-  <div class="card">
-    <h1>Небесный разведчик</h1>
-    <p>Приложение в разработке.</p>
-    <ul>
-      <li><span class="dot">•</span> вердикт на сегодня: стоит ли выходить</li>
-      <li><span class="dot">•</span> куда отъехать за тёмным небом</li>
-      <li><span class="dot">•</span> режим съёмки: выдержка, таймлапс, пролёты МКС</li>
-      <li><span class="dot">•</span> наведи телефон на небо — подписи объектов поверх камеры</li>
-    </ul>
+  <video id="camera" class="camera" playsinline muted autoplay aria-hidden="true"></video>
+  <div class="red-filter" aria-hidden="true"></div>
+  <canvas id="sky" class="sky" aria-label="Карта неба. Проведите пальцем, чтобы повернуть; нажмите на объект, чтобы узнать о нём."></canvas>
+
+  <header class="hud-top">
+    <button class="chip" id="place-btn" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+      <span id="place-name">Выбрать место</span>
+    </button>
+    <div class="hud-actions">
+      <button class="round" id="find-btn" type="button" aria-label="Найти объект">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg>
+      </button>
+      <button class="chip" id="mode-btn" type="button" aria-label="Режим карты">
+        <span id="mode-name">Вручную</span>
+      </button>
+      <button class="round" id="menu-btn" type="button" aria-label="Слои и настройки">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <button class="banner" id="banner" type="button" hidden></button>
+  <p class="center-hint" id="center-hint" hidden></p>
+  <p class="toast" id="toast" role="status" hidden></p>
+
+  <div class="calib" id="calib" hidden>
+    <p>Ведите пальцем влево-вправо, чтобы совместить Луну, Солнце или яркую звезду с настоящими. Поправка: <b id="calib-value">0°</b></p>
+    <button class="btn primary" id="calib-done" type="button">Готово</button>
   </div>
+
+  <section class="card" id="card" hidden aria-live="polite"></section>
+
+  <footer class="hud-bottom">
+    <div class="timebar">
+      <button class="tb" type="button" data-step="-3600000" aria-label="На час назад">−1 ч</button>
+      <button class="tb" type="button" data-step="-600000" aria-label="На 10 минут назад">−10 м</button>
+      <div class="time-display" id="time-display" title="Проведите пальцем, чтобы листать время">
+        <span class="time-main" id="time-main">--:--</span>
+        <span class="time-date" id="time-date"></span>
+        <span class="time-offset" id="time-offset">сейчас</span>
+      </div>
+      <button class="tb" type="button" data-step="600000" aria-label="На 10 минут вперёд">+10 м</button>
+      <button class="tb" type="button" data-step="3600000" aria-label="На час вперёд">+1 ч</button>
+    </div>
+    <button class="now-btn" id="now-btn" type="button">Сейчас</button>
+  </footer>
+
+  <!-- Первый запуск -->
+  <div class="welcome" id="welcome" hidden>
+    <div class="welcome-box">
+      <h1>Небесный разведчик</h1>
+      <p class="lead">Наведите телефон на небо — покажу, где сейчас спутники, планеты, Солнце и Луна, звёзды и созвездия. Даже днём и за горизонтом.</p>
+      <ul class="perms">
+        <li><b>Геолокация</b> — чтобы посчитать небо именно над вами. Координаты остаются на телефоне.</li>
+        <li><b>Датчики движения</b> — чтобы карта поворачивалась вслед за телефоном.</li>
+        <li><b>Камера</b> — только в режиме AR и только по вашему нажатию. Видео никуда не отправляется.</li>
+      </ul>
+      <button class="btn primary" id="start-btn" type="button">Начать</button>
+      <button class="btn" id="manual-start" type="button">Без датчиков — крутить пальцем</button>
+    </div>
+  </div>
+
+  <!-- Место -->
+  <div class="sheet-backdrop" id="place-sheet" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="place-title">
+      <div class="sheet-head"><h2 id="place-title">Где вы смотрите на небо?</h2><button class="round" type="button" data-close aria-label="Закрыть">✕</button></div>
+      <button class="btn primary" id="place-locate" type="button">Определить моё место</button>
+      <p class="error" id="place-error" role="alert" hidden></p>
+      <label class="field"><span>Город или посёлок</span>
+        <input id="search-input" type="search" autocomplete="off" autocapitalize="words" spellcheck="false" placeholder="Например, Теруэль"></label>
+      <ul class="pick" id="search-results"></ul>
+      <label class="field"><span>Или координаты: широта, долгота</span>
+        <input id="coords-input" type="text" inputmode="decimal" autocomplete="off" placeholder="41.39, 2.17"></label>
+      <button class="btn" id="coords-btn" type="button">Смотреть отсюда</button>
+    </div>
+  </div>
+
+  <!-- Режим -->
+  <div class="sheet-backdrop" id="mode-sheet" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="mode-title">
+      <div class="sheet-head"><h2 id="mode-title">Режим карты</h2><button class="round" type="button" data-close aria-label="Закрыть">✕</button></div>
+      <ul class="pick modes">
+        <li><button type="button" data-mode="sensors"><b>Датчики</b><span>Водите телефоном по небу — карта повторяет движения.</span></button></li>
+        <li><button type="button" data-mode="ar" id="mode-ar"><b>AR — поверх камеры</b><span>Подписи прямо на изображении с камеры.</span></button></li>
+        <li><button type="button" data-mode="manual"><b>Вручную</b><span>Крутите небо пальцем, щипком — масштаб.</span></button></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Слои и настройки -->
+  <div class="sheet-backdrop" id="settings-sheet" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="sheet-head"><h2 id="settings-title">Слои и настройки</h2><button class="round" type="button" data-close aria-label="Закрыть">✕</button></div>
+      <h3>Что показывать</h3>
+      <div class="toggles">
+        <label><input type="checkbox" data-layer="planets"><span>Солнце, Луна, планеты</span></label>
+        <label><input type="checkbox" data-layer="satellites"><span>Спутники</span></label>
+        <label><input type="checkbox" data-layer="starlink"><span>Starlink</span></label>
+        <label><input type="checkbox" data-layer="stars"><span>Звёзды</span></label>
+        <label><input type="checkbox" data-layer="constellations"><span>Созвездия</span></label>
+        <label><input type="checkbox" data-layer="labels"><span>Подписи</span></label>
+        <label><input type="checkbox" data-layer="grid"><span>Сетка высот</span></label>
+      </div>
+      <h3>Тема</h3>
+      <div class="segmented">
+        <button type="button" data-theme-mode="auto">Авто</button>
+        <button type="button" data-theme-mode="red">Ночная красная</button>
+        <button type="button" data-theme-mode="dark">Тёмная</button>
+      </div>
+      <p class="muted small">«Авто» включает красную тему, как только стемнеет: она не сбивает привыкание глаз к темноте.</p>
+      <h3>Компас</h3>
+      <p class="muted" id="compass-status"></p>
+      <p class="muted small">Если небо на экране съехало вбок — отойдите от машины и металла, опишите телефоном восьмёрку или подстройте вручную.</p>
+      <div class="row2">
+        <button class="btn" id="calib-start" type="button">Подстроить</button>
+        <button class="btn" id="calib-reset" type="button">Сбросить</button>
+      </div>
+      <h3>AR</h3>
+      <label class="field"><span>Угол обзора камеры: <b id="ar-fov-value">63°</b></span>
+        <input type="range" id="ar-fov" min="40" max="90" step="1"></label>
+      <p class="muted small">Если подписи в AR «плывут» при повороте — подберите угол, чтобы они совпали с небом.</p>
+      <h3>Спутники</h3>
+      <p class="muted" id="sat-status"></p>
+      <button class="btn" id="sat-refresh" type="button">Обновить орбиты</button>
+      <h3>Данные</h3>
+      <p class="muted small">Планеты, Солнце и Луна — astronomy-engine (MIT). Спутники — CelesTrak, расчёт satellite.js (MIT).
+        Звёзды и созвездия — каталог Hipparcos из проекта d3-celestial (BSD), расстояния — каталог HYG (CC BY-SA).
+        Поиск мест — Open-Meteo. Всё считается на телефоне; без рекламы, аккаунтов и сбора статистики.</p>
+    </div>
+  </div>
+
+  <!-- Поиск объекта -->
+  <div class="sheet-backdrop" id="find-sheet" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="find-title">
+      <div class="sheet-head"><h2 id="find-title">Найти на небе</h2><button class="round" type="button" data-close aria-label="Закрыть">✕</button></div>
+      <div id="find-list"></div>
+    </div>
+  </div>
+
+  <noscript><p class="noscript">Для работы нужен JavaScript.</p></noscript>
 </body>
 </html>

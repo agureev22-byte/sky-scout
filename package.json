@@ -1,0 +1,10 @@
+{
+  "name": "sky-scout",
+  "private": true,
+  "description": "Небесный разведчик — веб-приложение для наблюдения за ночным небом (статический сайт, GitHub Pages)",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "serve": "npx http-server -c-1 -p 8080 ."
+  }
+}

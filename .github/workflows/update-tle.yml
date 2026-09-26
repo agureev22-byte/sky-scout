@@ -1,0 +1,44 @@
+# Раз в сутки обновляет копию TLE спутников на сайте (data/tle/*.txt).
+# Приложение берёт её, если CelesTrak недоступен из браузера.
+name: Обновление TLE
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-tle
+  cancel-in-progress: false
+
+jobs:
+  update-tle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить репозиторий
+        uses: actions/checkout@v4
+
+      - name: Установить Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Скачать TLE с CelesTrak
+        run: node tools/fetch-tle.mjs
+
+      - name: Закоммитить изменения
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data/tle
+          if git diff --cached --quiet; then
+            echo "TLE не изменились — коммит не нужен."
+            exit 0
+          fi
+          git commit -m "Обновление TLE спутников"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

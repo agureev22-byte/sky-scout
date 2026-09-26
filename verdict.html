@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Небесный разведчик — вердикт (черновик)</title>
+<meta name="description" content="Стоит ли сегодня выходить смотреть на звёзды: облачность, Луна, засветка и планеты — для вашего места.">
+<meta name="theme-color" content="#05070d">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Разведчик">
+<meta name="format-detection" content="telephone=no">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="css/verdict.css">
+<script>
+  // Тема до отрисовки: ночью сразу красная, чтобы экран не ослепил.
+  (function () {
+    try {
+      var m = JSON.parse(localStorage.getItem('sky-scout:theme-v1'));
+      var h = new Date().getHours();
+      var t = m === 'red' || m === 'dark' ? m : (h >= 20 || h < 7 ? 'red' : 'dark');
+      document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  })();
+</script>
+<script type="module" src="js/verdict-app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <button class="place" id="place-btn" type="button" aria-haspopup="dialog">
+      <span class="place-icon" aria-hidden="true"></span>
+      <span class="place-text">
+        <span class="place-name" id="place-name">Место не выбрано</span>
+        <span class="place-sub" id="place-sub"></span>
+      </span>
+    </button>
+    <div class="top-actions">
+      <button class="icon-btn" id="refresh-btn" type="button" aria-label="Обновить прогноз"></button>
+      <button class="icon-btn" id="theme-btn" type="button" aria-label="Переключить тему"></button>
+    </div>
+  </header>
+
+  <main id="app">
+    <section class="card intro" id="intro" hidden>
+      <h1>Небесный разведчик</h1>
+      <p class="lead">Скажу прямо, стоит ли сегодня выходить смотреть на небо, а если нет — когда ближайшая хорошая ночь.</p>
+      <p>Для этого нужно знать, где вы: облачность, Луна и засветка у каждого места свои.
+        Координаты уходят только в запрос прогноза погоды (Open-Meteo) и больше никуда. Регистрации нет.</p>
+      <p class="intro-error" id="intro-error" role="alert" hidden></p>
+      <button class="btn primary" id="locate-btn" type="button">Определить моё место</button>
+      <button class="btn" id="choose-btn" type="button">Выбрать город вручную</button>
+    </section>
+
+    <div id="screen" hidden>
+      <section class="card verdict" id="verdict" aria-live="polite"></section>
+      <section class="card next" id="next" hidden></section>
+      <section class="card" id="timeline" hidden></section>
+      <section class="card" id="objects" hidden></section>
+      <section class="card" id="factors" hidden></section>
+      <section class="card" id="week" hidden></section>
+    </div>
+
+    <footer class="foot" id="foot">
+      <p id="forecast-note"></p>
+      <p class="sources">Погода — <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0).
+        Небо считается прямо на телефоне библиотекой <a href="https://github.com/cosinekitty/astronomy" target="_blank" rel="noopener">astronomy-engine</a>.
+        Города для оценки засветки — <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> (CC BY 4.0).</p>
+      <p class="sources">Без рекламы, аккаунтов и сбора статистики.</p>
+    </footer>
+  </main>
+
+  <div class="sheet-backdrop" id="sheet" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <div class="sheet-head">
+        <h2 id="sheet-title">Где смотрим на небо?</h2>
+        <button class="icon-btn" id="sheet-close" type="button" aria-label="Закрыть"></button>
+      </div>
+      <button class="btn primary" id="sheet-locate" type="button">Определить моё место</button>
+      <p class="sheet-error" id="sheet-error" role="alert" hidden></p>
+      <label class="field">
+        <span>Город или посёлок</span>
+        <input id="search-input" type="search" inputmode="search" autocomplete="off" autocapitalize="words" spellcheck="false" placeholder="Например, Теруэль">
+      </label>
+      <ul class="results" id="search-results"></ul>
+      <label class="field">
+        <span>Или координаты: широта, долгота</span>
+        <input id="coords-input" type="text" inputmode="decimal" autocomplete="off" placeholder="41.39, 2.17">
+      </label>
+      <button class="btn" id="coords-btn" type="button">Смотреть здесь</button>
+    </div>
+  </div>
+
+  <noscript><p class="noscript">Для работы приложения нужен JavaScript.</p></noscript>
+</body>
+</html>
