@@ -52,15 +52,17 @@
     </div>
   </header>
 
-  <button class="banner" id="banner" type="button" hidden></button>
-  <button class="compass-chip" id="compass-chip" type="button" hidden></button>
-  <p class="center-hint" id="center-hint" hidden></p>
-  <p class="toast" id="toast" role="status" aria-live="polite" hidden></p>
-
-  <div class="calib" id="calib" hidden>
-    <p>Ведите пальцем влево-вправо, чтобы совместить Луну, Солнце или яркую звезду с настоящими. Поправка: <b id="calib-value">0°</b></p>
-    <button class="btn primary" id="calib-done" type="button">Готово</button>
+  <!-- Подсказки под верхней панелью — стопкой, чтобы не налезали друг на друга. -->
+  <div class="hud-stack">
+    <button class="banner" id="banner" type="button" hidden></button>
+    <button class="compass-chip" id="compass-chip" type="button" hidden></button>
+    <div class="calib" id="calib" hidden>
+      <p>Ведите пальцем влево-вправо, чтобы совместить Луну, Солнце или яркую звезду с настоящими. Поправка: <b id="calib-value">0°</b></p>
+      <button class="btn primary" id="calib-done" type="button">Готово</button>
+    </div>
+    <p class="toast" id="toast" role="status" aria-live="polite" hidden></p>
   </div>
+  <p class="center-hint" id="center-hint" hidden></p>
 
   <section class="card" id="card" hidden aria-labelledby="card-title">
     <div class="card-head">
@@ -68,12 +70,12 @@
         <h2 id="card-title"></h2>
         <p class="card-sub" id="card-sub"></p>
       </div>
-      <button class="round" id="card-close" type="button" aria-label="Закрыть карточку">✕</button>
+      <div class="card-buttons">
+        <button class="chip small" id="card-center" type="button">Навести</button>
+        <button class="round" id="card-close" type="button" aria-label="Закрыть карточку">✕</button>
+      </div>
     </div>
     <div id="card-body"></div>
-    <div class="card-actions">
-      <button class="btn" id="card-center" type="button">Навести</button>
-    </div>
   </section>
 
   <footer class="hud-bottom">
@@ -101,8 +103,10 @@
         <li><b>Датчики движения</b> — чтобы карта поворачивалась вслед за телефоном.</li>
         <li><b>Камера</b> — только в режиме AR и только по вашему нажатию. Видео никуда не отправляется.</li>
       </ul>
-      <button class="btn primary" id="start-btn" type="button">Начать</button>
-      <button class="btn" id="manual-start" type="button">Без датчиков — крутить пальцем</button>
+      <div class="welcome-actions">
+        <button class="btn primary" id="start-btn" type="button">Начать</button>
+        <button class="btn" id="manual-start" type="button">Без датчиков — крутить пальцем</button>
+      </div>
     </div>
   </div>
 

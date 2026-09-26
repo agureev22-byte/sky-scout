@@ -203,7 +203,18 @@ try {
     await page.waitForSelector('#welcome', { state: 'hidden' });
     await page.waitForFunction(() => window.__sky.state.cat, null, { timeout: 15000 });
     const sun = await page.evaluate(() => { const b = window.__sky.sky.body('sun'); return { az: b.az, alt: b.alt }; });
+    // Сразу высоко в небо: компас iPhone ещё не пойман — должна быть подсказка.
+    await page.evaluate(() => {
+      const e = new Event('deviceorientation');
+      Object.assign(e, { alpha: 10, beta: 140, gamma: 0, webkitCompassHeading: 200, webkitCompassAccuracy: 5 });
+      window.dispatchEvent(e);
+    });
+    await page.waitForTimeout(300);
+    assert.match(await page.textContent('#compass-chip'), /Ловлю компас/);
+    assert.equal(await page.isVisible('#banner'), false, 'баннер «датчики не отвечают» не висит при живых датчиках');
+    await shot(page, '09a-compass-waiting');
     await pointPhone(page, sun.az, sun.alt);
+    assert.equal(await page.isVisible('#compass-chip'), false, 'компас пойман — подсказка ушла');
     const mode = await page.evaluate(() => window.__sky.settings.mode);
     assert.equal(mode, 'sensors', 'после «Начать» — режим датчиков');
     const hint = await page.textContent('#center-hint');
@@ -233,6 +244,23 @@ try {
     assert.ok(ar.w > 0, 'видео с камеры идёт');
     assert.match(await page.textContent('#center-hint'), /Луна/);
     await shot(page, '11-ar-moon');
+    await context.close();
+  }
+
+  // ---- 3б. Альбомная ориентация: карточка читается ----
+  {
+    const { context, page } = await newPage({ time: '2026-09-26T20:30:00Z' });
+    await page.setViewportSize({ width: 844, height: 390 });
+    await page.goto(base);
+    await page.getByRole('button', { name: 'Без датчиков — крутить пальцем' }).click();
+    await page.waitForSelector('#welcome', { state: 'hidden' });
+    await page.waitForFunction(() => window.__sky.state.cat, null, { timeout: 15000 });
+    await page.click('#find-btn');
+    await page.locator('#find-list button', { hasText: 'Луна' }).first().click();
+    await page.waitForTimeout(800);
+    const box = await page.locator('#card').boundingBox();
+    assert.ok(box.height >= 96, `высота карточки ${box.height}`);
+    await shot(page, '13-landscape-moon');
     await context.close();
   }
 

@@ -101,7 +101,8 @@ test('эталон компаса: вертикально — курс каме�
     assert.ok(angDiff(compassReference(rotationMatrix(alpha, 0, 0)), expected) < 1e-6, 'плашмя');
     assert.ok(angDiff(compassReference(rotationMatrix(alpha, 90, 0)), expected) < 1e-6, 'вертикально');
     assert.equal(compassReference(rotationMatrix(alpha, 45, 0)), null, 'под 45° не учимся');
-    assert.equal(compassReference(rotationMatrix(alpha, 90, 90)), compassReference(rotationMatrix(alpha, 90, 90)));
+    assert.equal(compassReference(rotationMatrix(alpha, 0, 90)), null, 'альбомная — не учимся');
+    assert.equal(compassReference(rotationMatrix(alpha, 180, 0)), null, 'экраном вниз — не учимся');
   }
 });
 
@@ -201,4 +202,108 @@ test('Солнце и Луна: положения и фаза', () => {
   assert.ok(moon.illum > 0.95, 'полнолуние 26.09.2026');
   assert.ok(moon.distKm > 350000 && moon.distKm < 410000);
   assert.ok(angleBetween(sun.vec, moon.vec) > 170, 'в полнолуние Луна напротив Солнца');
+});
+
+// ---- сценарии компаса по шагам времени ----
+function feed(t, events, startMs = 1e6, stepMs = 16) {
+  let now = startMs;
+  for (const e of events) {
+    t.handle(e, e.__abs || false, now);
+    now += e.__dt ?? stepMs;
+  }
+  return now;
+}
+const rep = (n, e) => Array.from({ length: n }, () => ({ ...e }));
+const camAz = (t) => altAz(t.axes(0, 0, 0).f).az;
+
+test('компас: плашмя на столе → поднять к горизонту', () => {
+  const t = new OrientationTracker();
+  // плашмя: iOS даёт курс верха телефона; верх смотрит туда же, куда потом камера
+  const flat = { ...poseEvent(40, -90, 0, 73), webkitCompassHeading: 40 };
+  // poseEvent для alt=−90 вырожден — строим «плашмя» прямо из alpha: верх телефона на азимут 40
+  flat.alpha = ((360 - 40 + 73) % 360 + 360) % 360;
+  flat.beta = 0;
+  flat.gamma = 0;
+  feed(t, rep(30, flat));
+  assert.equal(t.hasCompass, true);
+  t.smooth = null;
+  feed(t, rep(30, poseEvent(40, 3, 0, 73)));
+  t.smooth = null;
+  assert.ok(angDiff(camAz(t), 40) < 1, `азимут ${camAz(t)}`);
+});
+
+test('компас: пока телефон поворачивают, поправку не учим (компас отстаёт)', () => {
+  const t = new OrientationTracker();
+  let now = feed(t, rep(40, poseEvent(100, 0, 0, 73)));
+  // быстрый поворот 100° → 190° за 1 с; компас iPhone отстаёт на 0,3 с (≈27°)
+  for (let k = 0; k <= 60; k++) {
+    const az = 100 + (90 * k) / 60;
+    const lagged = 100 + (90 * Math.max(0, k - 18)) / 60;
+    t.handle(poseEvent(az, 0, 0, 73, lagged), false, now);
+    now += 16;
+  }
+  t.smooth = null;
+  assert.ok(angDiff(camAz(t), 190) < 1.5, `после поворота азимут ${camAz(t)}`);
+});
+
+test('компас: пауза в событиях (экран гас) — учим заново', () => {
+  const t = new OrientationTracker();
+  let now = feed(t, rep(20, poseEvent(10, 0, 0, 73)));
+  assert.equal(t.hasCompass, true);
+  now += 5000; // пауза 5 с, iOS выбрал новый ноль alpha
+  t.handle(poseEvent(10, 40, 0, 200), false, now);
+  assert.equal(t.waitingForCompass, true, 'под 40° после паузы — ждём горизонта');
+  now = feed(t, rep(20, poseEvent(10, 2, 0, 200)), now + 16);
+  t.smooth = null;
+  assert.ok(angDiff(camAz(t), 10) < 1e-6);
+  assert.equal(t.resets, 1);
+});
+
+test('компас: курс снова −1 после обучения — поправка остаётся', () => {
+  const t = new OrientationTracker();
+  feed(t, rep(10, poseEvent(250, 0, 0, 73)));
+  feed(t, rep(10, { ...poseEvent(250, 0, 0, 73), webkitCompassHeading: -1 }), 1e6 + 200);
+  assert.equal(t.mode, 'ios');
+  t.smooth = null;
+  assert.ok(angDiff(camAz(t), 250) < 1e-6);
+});
+
+test('компас: курс есть, но точность −1 — это не компас', () => {
+  const t = new OrientationTracker();
+  feed(t, rep(10, { ...poseEvent(250, 0, 0, 73), webkitCompassAccuracy: -1 }));
+  assert.equal(t.hasCompass, false);
+  assert.equal(t.mode, 'relative');
+});
+
+test('компас: Android — абсолютные события, склонение, обычные события игнорируются', () => {
+  const t = new OrientationTracker();
+  const abs = { alpha: 360 - 120, beta: 90, gamma: 0, __abs: true }; // камера на 120° магнитного
+  feed(t, rep(5, abs));
+  assert.equal(t.mode, 'absolute');
+  assert.equal(t.hasCompass, true);
+  t.smooth = null;
+  assert.ok(angDiff(altAz(t.axes(5, 0, 0).f).az, 125) < 1e-6, 'склонение +5° учтено');
+  feed(t, rep(5, { alpha: 0, beta: 90, gamma: 0 }), 1e6 + 100);
+  t.smooth = null;
+  assert.ok(angDiff(altAz(t.axes(0, 0, 0).f).az, 120) < 1e-6, 'обычные события после абсолютных не мешают');
+});
+
+test('компас: обычные события с absolute: true не замораживают вид', () => {
+  const t = new OrientationTracker();
+  feed(t, [{ alpha: 360 - 30, beta: 90, gamma: 0, absolute: true }, { alpha: 360 - 60, beta: 90, gamma: 0, absolute: true }]);
+  t.smooth = null;
+  assert.ok(angDiff(altAz(t.axes(0, 0, 0).f).az, 60) < 1e-6);
+});
+
+test('компас: без компаса склонение не добавляется; stop() всё сбрасывает', () => {
+  const t = new OrientationTracker();
+  feed(t, rep(5, { alpha: 360 - 30, beta: 90, gamma: 0 }));
+  assert.equal(t.mode, 'relative');
+  t.smooth = null;
+  assert.ok(angDiff(altAz(t.axes(7, 0, 0).f).az, 30) < 1e-6);
+  t.stop();
+  assert.equal(t.hasData, false);
+  assert.equal(t.mode, 'none');
+  assert.equal(t.offset, null);
+  assert.equal(t.R, null);
 });

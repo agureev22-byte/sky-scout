@@ -173,17 +173,26 @@ body.ar .camera { display: block; }
 .round { width: var(--tap); justify-content: center; padding: 0; flex: none; }
 .chip:active, .round:active { filter: brightness(1.25); }
 
-.banner {
+.hud-stack {
   position: fixed;
-  z-index: 30;
+  z-index: 30; /* выше экрана приветствия и листов: сообщения должны быть видны всегда */
   top: calc(env(safe-area-inset-top) + 68px);
   left: calc(env(safe-area-inset-left) + 12px);
   right: calc(env(safe-area-inset-right) + 12px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+.hud-stack > * { pointer-events: auto; max-width: 100%; }
+.banner {
+  width: 100%;
   min-height: 52px;
   padding: 12px 16px;
   border-radius: 16px;
   border: 1px solid var(--warn);
-  background: var(--panel);
+  background: var(--panel-solid);
   color: var(--warn);
   font-weight: 600;
   text-align: center;
@@ -191,17 +200,12 @@ body.ar .camera { display: block; }
 
 /* Компаса нет — предупреждение прямо на карте (нажатие открывает подстройку). */
 .compass-chip {
-  position: fixed;
-  z-index: 6;
-  top: calc(env(safe-area-inset-top) + 68px);
-  left: 50%;
-  transform: translateX(-50%);
-  max-width: calc(100vw - 24px);
+  width: max-content;
   min-height: 44px;
   padding: 8px 16px;
   border-radius: 22px;
   border: 1px solid var(--warn);
-  background: var(--panel);
+  background: var(--panel-solid);
   color: var(--warn);
   font-size: 15px;
   font-weight: 600;
@@ -225,13 +229,9 @@ body.ar .camera { display: block; }
   pointer-events: none;
 }
 
-.toast {
-  position: fixed;
-  z-index: 30; /* выше экрана приветствия и листов */
+.hud-stack > .toast {
   pointer-events: none;
-  left: calc(env(safe-area-inset-left) + 12px);
-  right: calc(env(safe-area-inset-right) + 12px);
-  top: calc(env(safe-area-inset-top) + 68px);
+  width: 100%;
   margin: 0;
   padding: 12px 16px;
   border-radius: 16px;
@@ -243,17 +243,19 @@ body.ar .camera { display: block; }
 }
 
 .calib {
-  position: fixed;
-  z-index: 6;
-  left: calc(env(safe-area-inset-left) + 12px);
-  right: calc(env(safe-area-inset-right) + 12px);
-  top: calc(env(safe-area-inset-top) + 68px);
+  width: 100%;
   padding: 12px 14px;
   border-radius: 16px;
   background: var(--panel);
   border: 1px solid var(--accent);
 }
 .calib p { margin: 0 0 8px; }
+body.calibrating .center-hint { display: none; }
+@media (max-height: 500px) {
+  .calib { display: flex; align-items: center; gap: 12px; padding: 8px 12px; }
+  .calib p { margin: 0; font-size: 14px; }
+  .calib .btn { width: auto; margin: 0; min-height: 44px; }
+}
 
 /* ---- нижняя панель: шкала времени ---- */
 .hud-bottom {
@@ -308,6 +310,7 @@ body.ar .camera { display: block; }
   touch-action: none;
   cursor: ew-resize;
   line-height: 1.15;
+  padding-bottom: 6px;
   background-image: repeating-linear-gradient(90deg, transparent 0 9px, var(--line) 9px 10px);
   background-size: 100% 6px;
   background-repeat: no-repeat;
@@ -315,7 +318,8 @@ body.ar .camera { display: block; }
 }
 .time-main { font-size: 21px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .time-date { font-size: 12px; color: var(--dim); }
-.time-offset { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.time-offset { font-size: 13px; color: var(--dim); font-variant-numeric: tabular-nums; }
+body.shifted .time-offset { color: var(--fg); font-weight: 700; }
 .now-btn {
   min-height: 44px;
   padding: 0 22px;
@@ -354,6 +358,9 @@ body.shifted .card { bottom: calc(env(safe-area-inset-bottom) + 136px); }
   user-select: text;
 }
 .card-head { display: flex; align-items: flex-start; gap: 10px; justify-content: space-between; }
+.card-buttons { display: flex; gap: 8px; flex: none; }
+.chip.small { min-height: 50px; padding: 0 14px; font-size: 15px; }
+.card { min-height: 96px; }
 .card h2 { margin: 2px 0 0; font-size: 23px; line-height: 1.15; }
 .card-sub { margin: 3px 0 0; color: var(--dim); font-size: 14px; }
 .card h3 { margin: 14px 0 6px; font-size: 13px; letter-spacing: .05em; text-transform: uppercase; color: var(--dim); }
@@ -364,10 +371,13 @@ body.shifted .card { bottom: calc(env(safe-area-inset-bottom) + 136px); }
 .rows dd { margin: 0; font-size: 15px; font-weight: 550; line-height: 1.35; }
 .card-note { margin: 10px 0 0; color: var(--dim); font-size: 15px; }
 .card-lead { margin: 10px 0 2px; font-size: 16px; font-weight: 600; line-height: 1.35; color: var(--ok); }
-/* С датчиками карточка ниже прицела: объект в центре экрана остаётся виден. */
-body.live .card { max-height: calc(50vh - 84px - env(safe-area-inset-bottom) - 60px); }
-body.live .card { max-height: calc(50dvh - 84px - env(safe-area-inset-bottom) - 60px); }
-body.live.shifted .card { max-height: calc(50dvh - 136px - env(safe-area-inset-bottom) - 60px); }
+/* С датчиками карточка ниже прицела: объект в центре экрана остаётся виден.
+   (В широкой раскладке карточка сбоку и прицел не закрывает.) */
+@media (max-width: 699px) {
+  body.live .card { max-height: max(96px, calc(50vh - 84px - env(safe-area-inset-bottom) - 60px)); }
+  body.live .card { max-height: max(96px, calc(50dvh - 84px - env(safe-area-inset-bottom) - 60px)); }
+  body.live.shifted .card { max-height: max(96px, calc(50dvh - 136px - env(safe-area-inset-bottom) - 60px)); }
+}
 .passes { list-style: none; margin: 0; padding: 0; }
 .passes li { display: flex; flex-direction: column; padding: 7px 0 7px 12px; border-left: 3px solid var(--faint); margin: 4px 0; }
 .passes li.vis { border-left-color: var(--ok); }
@@ -416,6 +426,18 @@ body.live.shifted .card { max-height: calc(50dvh - 136px - env(safe-area-inset-b
 .perms { list-style: none; padding: 0; margin: 0 0 12px; }
 .perms li { padding: 10px 0; border-top: 1px solid var(--line); color: var(--dim); }
 .perms li b { color: var(--fg); }
+/* Кнопки приветствия всегда видны, даже в альбомной ориентации на маленьком экране. */
+.welcome-actions {
+  position: sticky;
+  bottom: calc(-24px - env(safe-area-inset-bottom));
+  padding: 4px 0 calc(12px + env(safe-area-inset-bottom));
+  background: var(--bg);
+}
+@media (max-height: 500px) {
+  .welcome h1 { font-size: 24px; margin: 0 0 8px; }
+  .welcome .lead { font-size: 16px; margin-bottom: 8px; }
+  .perms li { padding: 6px 0; font-size: 14px; }
+}
 
 /* ---- листы ---- */
 .sheet-backdrop {
@@ -477,6 +499,8 @@ body.live.shifted .card { max-height: calc(50dvh - 136px - env(safe-area-inset-b
 .pick button[disabled] { opacity: .45; }
 .pick .muted { padding: 10px 4px; }
 .modes button { min-height: 72px; }
+.modes button.current { box-shadow: inset 4px 0 0 var(--accent); padding-left: 14px; }
+.modes button.current b::after { content: ' — сейчас'; font-weight: 500; color: var(--dim); }
 .toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .toggles label {
   display: flex;
@@ -506,8 +530,8 @@ body.live.shifted .card { max-height: calc(50dvh - 136px - env(safe-area-inset-b
   .card { left: auto; right: calc(env(safe-area-inset-right) + 16px); width: min(420px, calc(50vw - 60px)); }
 }
 
-/* Узкие экраны (iPhone SE, «Увеличенный» режим): у места остаётся только значок. */
-@media (max-width: 359px) {
+/* Узкие экраны (iPhone SE, mini, «Увеличенный» режим): у места остаётся только значок. */
+@media (max-width: 389px) {
   #place-name { display: none; }
   #place-btn { padding: 0; width: var(--tap); justify-content: center; }
   #mode-btn { padding: 0 12px; }

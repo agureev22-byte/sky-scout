@@ -113,6 +113,9 @@ export class OrientationTracker {
     this.accuracy = null;
     this.smooth = null;
     this.listening = false;
+    this.absEvents = false; // приходят настоящие события deviceorientationabsolute
+    this.still = null; // {ref0, since}: телефон неподвижен — можно учить поправку компаса
+    this.resets = 0; // сколько раз поправку пришлось учить заново (после паузы в событиях)
     this._onAbs = (e) => this.handle(e, true);
     this._onRel = (e) => this.handle(e, false);
   }
@@ -136,6 +139,8 @@ export class OrientationTracker {
     this.mode = 'none';
     this.offset = null;
     this.accuracy = null;
+    this.absEvents = false;
+    this.still = null;
   }
 
   // Недавно были события (Android на неподвижном телефоне может молчать — для вида это не важно,
@@ -154,10 +159,20 @@ export class OrientationTracker {
     return this.mode === 'ios' && this.offset === null;
   }
 
-  handle(e, isAbsoluteEvent) {
+  handle(e, isAbsoluteEvent, now = Date.now()) {
     if (e.alpha === null || e.beta === null || e.gamma === null || e.alpha === undefined) return;
-    // Если приходят абсолютные события, относительные игнорируем.
-    if (!isAbsoluteEvent && this.mode === 'absolute') return;
+    if (isAbsoluteEvent) this.absEvents = true;
+    // Если идут настоящие абсолютные события (Android), обычные — лишние.
+    else if (this.absEvents) return;
+    // Пауза в событиях (экран гас, вкладка пряталась): iOS заново выбирает случайный ноль alpha —
+    // поправку компаса учим заново, а не рисуем небо повёрнутым.
+    if (this.lastEvent && now - this.lastEvent > 1000 && this.mode !== 'absolute') {
+      if (this.offset !== null || this.mode === 'relative') this.resets++;
+      this.offset = null;
+      this.smooth = null;
+      this.still = null;
+      if (this.mode === 'relative') this.mode = 'none';
+    }
     const R = rotationMatrix(e.alpha, e.beta, e.gamma);
     const heading = typeof e.webkitCompassHeading === 'number' ? e.webkitCompassHeading : null;
     const acc = typeof e.webkitCompassAccuracy === 'number' ? e.webkitCompassAccuracy : null;
@@ -165,21 +180,29 @@ export class OrientationTracker {
       this.mode = 'ios';
       this.accuracy = acc;
       const ref = compassReference(R);
-      if (ref !== null) {
+      if (ref === null) {
+        this.still = null;
+      } else {
+        // Компас iPhone отстаёт от гироскопа: пока телефон поворачивают, сравнивать нельзя.
+        // Учимся, только когда телефон ~0,3 с неподвижен (первый раз — сразу).
+        // «Неподвижен» — с начала отсчёта курс ушёл не больше чем на 2° (шум датчиков меньше).
+        const st = this.still;
+        if (!st || Math.abs(wrap180(ref - st.ref0)) > 2) this.still = { ref0: ref, since: now };
         const off = wrap180(heading - ref);
         if (this.offset === null) this.offset = off;
-        else this.offset = wrap180(this.offset + 0.08 * wrap180(off - this.offset));
+        else if (now - this.still.since >= 300) this.offset = wrap180(this.offset + 0.05 * wrap180(off - this.offset));
       }
     } else if (isAbsoluteEvent || e.absolute === true) {
       this.mode = 'absolute';
       this.offset = 0;
-    } else if (this.mode === 'none') {
+    } else if (this.mode === 'none' || this.mode === 'absolute') {
       // Компаса пока нет (или iOS ещё не откалибровал его) — углы относительные.
       this.mode = 'relative';
+      this.offset = null;
     }
     this.R = R;
     this.hasData = true;
-    this.lastEvent = Date.now();
+    this.lastEvent = now;
     this.onChange();
   }
 

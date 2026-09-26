@@ -48,10 +48,12 @@ export function kmText(km) {
 function auText(au) {
   const mkm = (au * KM_PER_AU) / 1e6;
   const minutes = Math.round((au * KM_PER_AU) / 299792.458 / 60);
-  const light = minutes < 60
-    ? unit(minutes, plural(minutes, 'минуту', 'минуты', 'минут'))
-    : `${unit(Math.floor(minutes / 60), 'ч')} ${unit(minutes % 60, 'мин')}`;
-  return `${unit(decimal(au, au < 10 ? 2 : 1), 'а. е.')} (${unit(decimal(mkm, mkm < 100 ? 1 : 0), 'млн км')}), свет идёт ${light}`;
+  let light;
+  if (minutes < 60) light = unit(minutes, plural(minutes, 'минуту', 'минуты', 'минут'));
+  else if (minutes % 60 === 0) light = unit(minutes / 60, 'ч');
+  else light = `${unit(Math.floor(minutes / 60), 'ч')} ${unit(minutes % 60, 'мин')}`;
+  const mkmText = mkm < 100 ? decimal(mkm, 1) : Math.round(mkm).toLocaleString('ru-RU');
+  return `${unit(decimal(au, au < 10 ? 2 : 1), 'а. е.')} (${unit(mkmText, 'млн км')}), свет идёт ${light}`;
 }
 
 // Световые годы с правильным падежом: «4,2 св. года», «101 св. год», «25 св. лет».
@@ -212,7 +214,13 @@ export function satCard(sat, pos, fmt, now, { passes = null, next = null, ageDay
   else if (pos && pos.alt > 0) lead = 'Сейчас над горизонтом, но в тени Земли — глазом не виден.';
   if (next) {
     const t = passText(next, fmt, now);
-    lead = `${lead ? `${lead} ` : ''}${next.visible ? 'Следующий видимый пролёт' : 'Следующий пролёт'}: ${t.when}, ${t.path}.`;
+    const vis = next.visible && next.vis;
+    const startT = vis ? next.vis.from.t : next.rise.t;
+    const endT = vis ? next.vis.to.t : next.set.t;
+    const text = startT <= now
+      ? `${vis ? 'Виден' : 'Над горизонтом'} до${NB}${fmt.time(endT)}: ${t.path}.`
+      : `${vis ? 'Следующий видимый пролёт' : 'Следующий пролёт'}: ${t.when}, ${t.path}.`;
+    lead = `${lead ? `${lead} ` : ''}${text}`;
   }
   let note = null;
   if (ageDays !== null && Math.abs(ageDays) > 14) note = 'Данные орбиты старые — положение может быть неточным.';

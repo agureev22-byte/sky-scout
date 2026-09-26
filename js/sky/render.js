@@ -110,6 +110,8 @@ export class Renderer {
     lx = Math.max(4, Math.min(W - w - 4, lx));
     const ly = y + dy;
     const rect = [lx - 2, ly - h, lx + w + 2, ly + 3];
+    // под верхней панелью кнопок подписи не рисуем (кроме обязательных)
+    if (!force && rect[1] < (this.topInset || 0)) return false;
     if (!force) {
       for (const r of this.labels) {
         if (rect[0] < r[2] && rect[2] > r[0] && rect[1] < r[3] && rect[3] > r[1]) return false;
@@ -138,6 +140,7 @@ export class Renderer {
     this.labels = [];
     this.bodyLabels = [];
     this.W = W;
+    this.topInset = s.insets ? s.insets.top - 20 : 0;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.textBaseline = 'alphabetic';
 
@@ -195,7 +198,8 @@ export class Renderer {
         if (p.x < -10 || p.x > W + 10 || p.y < -10 || p.y > H + 10) continue;
         const r = clamp(0.55 + (5.3 - m) * 0.4, 0.55, 3.8) * zoom;
         buckets[cat.color[i]].push(p.x, p.y, r, m);
-        if (m < 3.6 || cat.names[cat.hip[i]]) this.hits.push({ x: p.x, y: p.y, prio: 0, type: 'star', index: i });
+        // яркие звёзды важнее соседних тусклых: подсказка «в прицеле» назовёт именно их
+        if (m < 3.6 || cat.names[cat.hip[i]]) this.hits.push({ x: p.x, y: p.y, prio: m < 1 ? 2 : m < 2.5 ? 1 : 0, type: 'star', index: i });
       }
       buckets.forEach((b, ci) => {
         ctx.fillStyle = pal.stars[ci];
@@ -608,8 +612,11 @@ export class Renderer {
     }
 
     if (!sel.vec) return;
-    // Тот же критерий, что у подписи объекта: центр на экране — кольцо, иначе — стрелка.
-    const onScreen = view.project(sel.vec, p, F) && view.isOnScreen(p, 0) && p.y < view.height - (s.insets ? s.insets.bottom : 0);
+    // Тот же критерий, что у подписи объекта: центр на экране и не под карточкой — кольцо, иначе — стрелка.
+    const inFront = view.project(sel.vec, p, F);
+    const occ = s.occluder;
+    const underCard = inFront && occ && p.x > occ.left && p.x < occ.right && p.y > occ.top && p.y < occ.bottom;
+    const onScreen = inFront && view.isOnScreen(p, 0) && !underCard;
     if (onScreen) {
       ctx.strokeStyle = pal.select;
       ctx.lineWidth = 2.5;
@@ -624,15 +631,21 @@ export class Renderer {
     }
     // Объект за краем экрана — стрелка, куда повернуть телефон.
     const v = sel.vec;
-    const x = view.r[0] * v[0] + view.r[1] * v[1] + view.r[2] * v[2];
-    const y = view.u[0] * v[0] + view.u[1] * v[1] + view.u[2] * v[2];
-    const ang = Math.atan2(-y, x);
     const W = view.width;
     const H = view.height;
     const insetTop = s.insets ? s.insets.top : 80;
     const insetBottom = s.insets ? s.insets.bottom : 120;
     const cx = W / 2;
     const cy = (insetTop + (H - insetBottom)) / 2;
+    let ang;
+    if (underCard) {
+      // объект на экране, но под карточкой — стрелка от середины видимой части прямо к нему
+      ang = Math.atan2(p.y - cy, p.x - cx);
+    } else {
+      const x = view.r[0] * v[0] + view.r[1] * v[1] + view.r[2] * v[2];
+      const y = view.u[0] * v[0] + view.u[1] * v[1] + view.u[2] * v[2];
+      ang = Math.atan2(-y, x);
+    }
     const hw = W / 2 - 34;
     const hh = (H - insetBottom - insetTop) / 2 - 30;
     const dx = Math.cos(ang);
